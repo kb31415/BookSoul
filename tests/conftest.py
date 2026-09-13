@@ -159,3 +159,85 @@ def raw_plain_card() -> dict[str, Any]:
         "tags": "独行",  # 故意用 str 而不是 list：外部卡常见脏数据
         "character_version": None,
     }
+
+
+# ────────────────────────── 阶段 2：小说语料 ──────────────────────────
+
+
+def make_sample_novel_text() -> str:
+    """一段"格式规整"的样例小说：**程序计数**可知有 5 章。
+
+    故意混入盗版站广告行、连续空行、`\\r\\n` 换行，用来验证清洗。
+
+    自带"目测校准"：每章正文都是 ``第{i}章正文。`` 重复 `REPEAT` 次，
+    所以章节数与每章字数都能一眼数出来。
+    """
+    repeat = 40
+    body = {i: f"第{i}章正文。" * repeat for i in range(1, 6)}
+    return (
+        "《青云旧事》\n"
+        "作者：无名\n"
+        "请记住本站域名 www.example-ad.com\n"
+        "\r\n"
+        "\r\n"
+        f"第一章 雨夜\n{body[1]}\n"
+        "\n"
+        "手机用户请访问 m.example-ad.com\n"
+        f"第二章 剑冢\n{body[2]}\n"
+        "\n"
+        "\n"
+        "\n"
+        f"第三章 旧约\n{body[3]}\n"
+        "最新章节目录 请记住本站\n"
+        f"第四章 叛徒\n{body[4]}\n"
+        f"第五章 长夜\n{body[5]}\n"
+        "（本章完）\n"
+    )
+
+
+@pytest.fixture()
+def sample_novel_text() -> str:
+    return make_sample_novel_text()
+
+
+#: 「真实短篇」语料的章节定义：**(标题, 每章一句, 重复次数)**。
+#: 章节数直接由这个列表长度给出，所以"目测一致"是可以程序化断言的。
+REAL_STORY_CHAPTERS: tuple[tuple[str, str, int], ...] = (
+    ("第一章 雨夜", "剑冢的雨下了整夜。沈知舟站在碑前，月白长衫湿透了。", 24),
+    ("第二章 旧约", "「你答应过我的。」师妹的声音在雨里发抖。他没有回头。", 20),
+    ("第三章 断剑", "断剑埋在三尺土下。他挖了一夜，指甲缝里全是血。", 16),
+    ("第四章 叛徒", "掌门问他为什么放人。他说手滑。掌门笑了，笑得很难看。", 18),
+    ("第五章 长夜", "长夜将尽的时候，他终于说出了那个名字。", 12),
+    ("第六章 出山", "山门在身后关上。他没有回头，一次都没有。", 14),
+)
+
+#: 真实语料里混入的盗版站噪声（清洗必须干掉它们）。
+REAL_STORY_NOISE = (
+    "\n（本章完）\n最新章节目录 请记住本站\nhttps://spam.example.com/x\n"
+)
+
+
+def make_real_story_text() -> str:
+    """一段"格式规整"的样例短篇：章节头 + 盗版站噪声 + 长短不一的章节。
+
+    章节数 = `len(REAL_STORY_CHAPTERS)`，每章字数由「一句 × 重复次数」给定，
+    所以切分结果可以逐章精确断言 —— 这就是阶段 2 验收里"目测一致"的可重复版本。
+    """
+    head = (
+        "《青云旧事》\n"
+        "作者：无名氏\n"
+        "请记住本站域名 www.example-ad.com\n"
+        "手机用户请访问 m.example-ad.com\n"
+    )
+    body = "\n".join(
+        f"\n{title}\n{line * repeat}\n{REAL_STORY_NOISE}"
+        for title, line, repeat in REAL_STORY_CHAPTERS
+    )
+    return head + body
+
+
+@pytest.fixture()
+def real_story_text() -> str:
+    return make_real_story_text()
+
+
