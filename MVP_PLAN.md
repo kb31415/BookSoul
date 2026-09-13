@@ -45,6 +45,7 @@ D:\story\
 │   ├── __init__.py
 │   ├── config.py                # 环境变量 / 模型名 / 路径
 │   ├── llm/client.py            # 阶段3：LiteLLM 封装（重试/超时/usage）
+│   ├── storage/repository.py    # 阶段1：存储抽象接口 + 文件实现 ★迭代友好
 │   ├── schema/
 │   │   ├── character.py         # 阶段1：CharacterCard 等（§6.4）
 │   │   └── tavern.py            # 阶段1：v2/v3 导入导出
@@ -54,8 +55,9 @@ D:\story\
 │   │   └── extract.py           # 阶段4：角色抽取
 │   ├── assemble/builder.py      # 阶段5：组装 + 校验
 │   ├── runtime/
+│   │   ├── context.py           # 阶段6：Context Assembler ★迭代友好
 │   │   ├── dialogue.py          # 阶段6：对话循环
-│   │   └── memory.py            # 阶段7：最简检索
+│   │   └── memory.py            # 阶段7：最简检索（条目结构）
 │   └── cli.py                   # 阶段8：CLI
 ├── tests/
 ├── data/{novels,cards,sessions,memory}/
@@ -68,6 +70,24 @@ D:\story\
 - 所有中间产物**落盘缓存**（识别结果、抽取结果），避免重复花钱。
 - LLM 返回的结构化数据一律用 **Pydantic 校验 + 失败重试一次**，仍失败则报错退出（不静默吞掉）。
 - 每个阶段的产物路径固定，便于后续阶段复用与人工检查。
+
+### 迭代友好性约束（必须留的接口，否则后面要重写）
+
+> **原则：MVP 可以砍「实现」，但不能砍「数据契约」和「模块边界」。**
+> 判断某个简化安不安全，只看一个问题：**它改变了数据契约或模块边界吗？** 改了 → 后面要重写；只是换了实现方式 → 后面换个函数即可。
+
+| # | 必须留 | 为什么 | MVP 阶段怎么做 |
+|---|---|---|---|
+| 1 | **存储抽象接口**（`CardRepository` / `MemoryRepository` / `SessionRepository`） | 让「文件 → Postgres + pgvector」只是换实现 | 先定义接口 + 一个 `FileXxxRepository` 实现；业务代码**只依赖接口** |
+| 2 | **Context Assembler 独立模块**（`runtime/context.py`） | 让「加预算降级、分层注入」不侵入对话循环 | 即使 MVP 不做降级，也把「拼 messages」抽成独立函数 `assemble_context(...)` |
+| 3 | **记忆用条目结构 + session 预留 `state`** | 让「加三层契约 / 状态机」不重构 | 记忆产出 `{id, tier, content, source, hits, corrected}` 条目（`tier` 全填 `heuristic`、不做晋升）；session 预留 `state: dict = {}` |
+
+**具体表现（违反即埋雷）**
+
+- **存储**：业务代码里**不允许**出现 `open("data/cards/xxx.json")` 这类直接文件操作，一律通过 Repository。
+- **上下文组装**：`dialogue.py` 里**不允许**直接拼 messages 数组，必须调用 `assemble_context(...)`。
+- **记忆**：即使只有一层，也**不允许**把记忆存成裸 messages 数组——必须是条目结构（`PROJECT_DESIGN.md` §13.6）。**这是唯一「砍错了第二阶段就要重写记忆系统」的一项。**
+- **状态**：session 结构里必须有 `state: dict = {}`（MVP 可为空），供后续 mood / 剧情 / 关系状态使用。
 
 ---
 
@@ -82,7 +102,8 @@ D:\story\
 2. 实现 `schema/character.py`：`CharacterCard` / `LoreEntry` / `TimelineEvent` / `Relation` / `PlotNode`（严格按 `PROJECT_DESIGN.md` §6.4）。
 3. 实现 `schema/tavern.py`：`to_tavern_v2()` 与 `from_tavern()`（含 `extensions.booksoul` 映射，见 §6.2）。
 4. `config.py`：读 `DEEPSEEK_API_KEY` / `MODEL_NAME` / `DATA_DIR`。
-5. 单测：序列化往返、v2 导出结构、**导入兼容两种格式**（有 `spec` 包装 / 裸字段 / 缺 `extensions`）。
+5. **定义存储抽象接口**（`storage/repository.py`）：`CardRepository` / `MemoryRepository` / `SessionRepository` 三个 Protocol/ABC + `FileXxxRepository` 实现（见 §1「迭代友好性约束」）。
+6. 单测：序列化往返、v2 导出结构、**导入兼容两种格式**（有 `spec` 包装 / 裸字段 / 缺 `extensions`）、Repository CRUD。
 
 **验收标准**：`pytest` 全绿；导出的 JSON 满足 v2 结构；导入缺字段的外部卡不报错。
 
@@ -158,14 +179,15 @@ D:\story\
 **目标**：能和抽取出的角色多轮对话。
 
 **关键任务**
-1. `runtime/dialogue.py`：加载角色卡 → 组装 messages（system: 角色卡 + few-shot；其后为历史）→ LiteLLM 流式 → 多轮循环。
-2. **稳定前缀置顶**：角色卡 + few-shot 放最前且逐字符不变，历史在后（为 cache 做准备，见设计 §5.2）。
-3. 会话落盘 `data/sessions/{session_id}.jsonl`（append-only）。
-4. 支持 `/exit`、`/reset`、`/regenerate`。
+1. **`runtime/context.py`（独立模块）**：实现 `assemble_context(card, history, retrieved, mood_state=None) -> messages`。**即使 MVP 不做预算降级，也必须抽成独立函数**（见 §1「迭代友好性约束」）。
+2. `runtime/dialogue.py`：加载角色卡 → **调用 `assemble_context(...)`**（不许自己拼 messages）→ LiteLLM 流式 → 多轮循环。
+3. **稳定前缀置顶**：角色卡 + few-shot 放最前且逐字符不变，历史/检索结果在后（为 cache 做准备，见设计 §5.2）。
+4. 会话落盘 `data/sessions/{session_id}.jsonl`（append-only），**结构里预留 `state: dict = {}`**（MVP 可为空，供后续 mood / 剧情 / 关系状态使用）。
+5. 支持 `/exit`、`/reset`、`/regenerate`。
 
 **验收标准**：对话语气**明显不是通用 AI 腔**，能看出原著风格。
 
-**依赖**：阶段 5　**常见坑**：① 模型不按角色说话 → few-shot 质量是关键（"演技七分靠 prompt"）；② 历史越长越贵 → 阶段 7 解决。
+**依赖**：阶段 5　**常见坑**：① 模型不按角色说话 → few-shot 质量是关键（"演技七分靠 prompt"）；② 历史越长越贵 → 阶段 7 解决；③ **把拼 messages 写死在 dialogue 里 → 后面加预算降级要重构**。
 
 ---
 
@@ -175,13 +197,14 @@ D:\story\
 
 **关键任务**
 1. `runtime/memory.py`：用 用户消息 + 角色名 做关键词检索（jieba 分词），从原文取 top-k 段落。
-2. 注入到 messages 的**动态区**（绝不能插进稳定前缀）。
-3. 历史超过 N 轮时，生成简单摘要替代远期原文。
-4. 单测：检索命中的段落确实包含相关剧情。
+2. **记忆必须用条目结构**：`{id, tier, content, source, hits, corrected}`（设计 §13.6）——**不许存成裸 messages 数组**；MVP 阶段 `tier` 全填 `heuristic`、不做晋升（见 §1「迭代友好性约束」）。
+3. 注入到 messages 的**动态区**（绝不能插进稳定前缀）。
+4. 历史超过 N 轮时，生成简单摘要替代远期原文。
+5. 单测：检索命中的段落确实包含相关剧情；记忆条目的读写往返。
 
 **验收标准**：能答对"你和 XX 什么关系"、"你们之间发生过什么"。
 
-**依赖**：阶段 6　**常见坑**：① 检索不准 → MVP 先用关键词，不用 embedding；② **注入位置破坏 cache** → 必须放动态区。
+**依赖**：阶段 6　**常见坑**：① 检索不准 → MVP 先用关键词，不用 embedding；② **注入位置破坏 cache** → 必须放动态区；③ **记忆存成裸 messages → 第二阶段加三层契约时要重写**。
 
 ---
 
