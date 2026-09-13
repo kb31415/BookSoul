@@ -67,6 +67,8 @@ REJECTED_LINES = [
     "他把第三章读了三遍，还是不懂。",          # 标题不在行首
     "序章的写法他改了三遍。",                  # "序章"后面是句子
     "尾声之后的故事还很长。",                  # 同理
+    "第一章正文。",                            # 标题词 + 正文句子（曾误判为标题）
+    "序章正文。",                              # 同类：特殊标题 + 正文句子
     "最后一章",                                # "最后"不是数字，本来就不是标题
     "最后一章里他死了。",
     "下一章见。",
@@ -95,6 +97,34 @@ def test_rejects_overlong_title_line() -> None:
     line = "第一章" + "正" * (CHAPTER_TITLE_MAX_LENGTH + 20)
 
     assert find_chapter_title(line) is None
+
+
+def test_body_sentence_with_chapter_word_is_not_a_title() -> None:
+    """回归：正文句子以「第X章 / 序章」开头时不能被当成标题。
+
+    此前的缺陷：标题正则的标题部分允许任意字符，导致 "第一章正文。" 这类
+    正文句子被判成标题 → 所有章节内容为空 → 整篇退化成兜底的「第1部分」。
+    """
+    assert find_chapter_title("第一章正文。") is None
+    assert find_chapter_title("序章正文。") is None
+    # 半角句点是**合法**的标题分隔符，不能被这条规则误杀
+    assert find_chapter_title("第一章.雨夜") == "第一章.雨夜"
+
+
+def test_body_lines_do_not_create_phantom_chapters() -> None:
+    """回归（端到端）：正文行不该切出幽灵章节，也不该把整篇打成兜底。"""
+    text = _make_novel(
+        [
+            ("序章 缘起", "序章正文。"),
+            ("第一章 开始", "第一章正文。"),
+            ("番外 之后的事", "番外正文。"),
+        ]
+    )
+
+    novel = parse_text(text, book_id="x")
+
+    assert [c.title for c in novel.chapters] == ["序章 缘起", "第一章 开始", "番外 之后的事"]
+    assert [c.content for c in novel.chapters] == ["序章正文。", "第一章正文。", "番外正文。"]
 
 
 def test_title_keeps_its_own_formatting() -> None:

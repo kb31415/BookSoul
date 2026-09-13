@@ -42,6 +42,9 @@ packages = ["src/booksoul"]
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
-addopts = "-q"
+# `-p no:tmpdir`：内置 tmpdir 插件会到**系统临时目录**建 basetemp，在受限沙箱下
+# 既写不进去、收尾清理还会抛 PermissionError（表现为大量 setup ERROR）。
+# 关掉它，`tmp_path` 改由 `tests/conftest.py` 提供（仓库内目录，沙箱可写）。
+addopts = "-q -p no:tmpdir"
 pythonpath = ["src"]
 filterwarnings = ["error::DeprecationWarning:booksoul.*"]

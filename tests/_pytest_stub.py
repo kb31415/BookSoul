@@ -19,7 +19,7 @@ from __future__ import annotations
 import sys
 from typing import Any, Callable, TypeVar
 
-__all__ = ["MonkeyPatch", "fixture", "raises"]
+__all__ = ["MonkeyPatch", "Skipped", "fixture", "mark", "raises", "skip"]
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -69,6 +69,42 @@ def raises(expected: Any, *args: Any, **kwargs: Any) -> _RaisesContext:
     if args or kwargs:
         raise NotImplementedError("替身只支持 with 语句形式")
     return _RaisesContext(expected)
+
+
+class Skipped(BaseException):
+    """`pytest.skip()` 抛出的信号。
+
+    刻意继承 `BaseException`（与真 pytest 的 `_pytest.outcomes.Skipped` 一致）——
+    这样 `except Exception` 不会误吞它，运行器必须显式识别。
+    """
+
+    def __init__(self, msg: str = "") -> None:
+        super().__init__(msg)
+        self.msg = msg
+
+
+def skip(reason: str = "", *, allow_module_level: bool = False) -> None:
+    """`pytest.skip(...)`：抛 `Skipped`，由运行器计为 skipped 而不是 failed。"""
+    raise Skipped(reason)
+
+
+class _Mark:
+    """只实现 `parametrize`（本项目测试里唯一用到的 mark）。
+
+    真正的参数展开由 `run_tests.py` 的 `_run_local()` 负责 —— 替身只把
+    `(argnames, argvalues)` 记在函数上，等运行器来展开。
+    """
+
+    @staticmethod
+    def parametrize(argnames: Any, argvalues: Any, **kwargs: Any) -> Any:
+        def decorate(target: F) -> F:
+            setattr(target, "_booksoul_parametrize", (argnames, argvalues))
+            return target
+
+        return decorate
+
+
+mark = _Mark()
 
 
 if "pytest" not in sys.modules:  # pragma: no cover - 只在无 pytest 时执行

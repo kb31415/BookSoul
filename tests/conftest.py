@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import itertools
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -239,5 +241,28 @@ def make_real_story_text() -> str:
 @pytest.fixture()
 def real_story_text() -> str:
     return make_real_story_text()
+
+
+# ────────────────────────── 沙箱友好的 tmp_path ──────────────────────────
+
+#: 用例临时目录的根。**刻意不用系统临时目录**：受限沙箱下 `tempfile.mkdtemp`
+#: 建出来的目录带受限 ACL，连自己都写不进去（pytest 内置的 `tmp_path` 正是这么
+#: 建的），表现为大量 setup ERROR。改成仓库内目录即可正常读写。
+_CASE_TMP_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "cases"
+_CASE_TMP_COUNTER = itertools.count()
+
+
+@pytest.fixture()
+def tmp_path() -> Path:
+    """覆盖 pytest 内置的同名夹具，改用**仓库内**目录（沙箱可写）。
+
+    conftest 中的夹具优先于插件提供的同名夹具，所以这一层覆盖是生效的。
+    `pyproject.toml` 里同时关掉了内置的 `tmpdir` 插件（`-p no:tmpdir`），
+    避免它再到系统临时目录建 basetemp 并在收尾清理时报权限错。
+    """
+    _CASE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    path = _CASE_TMP_ROOT / f"case-{os.getpid()}-{next(_CASE_TMP_COUNTER)}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 

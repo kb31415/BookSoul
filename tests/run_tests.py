@@ -111,8 +111,12 @@ def _collect_fixtures(modules: Iterable[Any]) -> dict[str, Callable[..., Any]]:
         for name, obj in vars(module).items():
             if not callable(obj):
                 continue
-            is_fixture = getattr(obj, "_booksoul_fixture", False) or hasattr(
-                obj, "_pytestfixturefunction"
+            is_fixture = (
+                getattr(obj, "_booksoul_fixture", False)
+                # pytest < 9 的标记名
+                or hasattr(obj, "_pytestfixturefunction")
+                # pytest 9+ 改成了这个名字（本项目 .venv 里是 9.1.1）
+                or hasattr(obj, "_fixture_function_marker")
             )
             if is_fixture:
                 fixtures[name] = obj
@@ -149,27 +153,64 @@ def _make_fixtures() -> dict[str, Callable[..., Any]]:
     return {"tmp_path": tmp_path, "monkeypatch": monkeypatch}
 
 
-def _install_pytest_stub() -> None:
-    """没装 pytest 时，把 `tests/_pytest_stub.py` 注册成 `pytest`。
+def _install_pytest_stub(*, force: bool = False) -> None:
+    """把 `tests/_pytest_stub.py` 注册成 `pytest`。
 
-    装了 pytest 的环境里这个函数什么都不做（真 pytest 已在 sys.modules）。
+    - 默认（`force=False`）：只在**没装 pytest** 时启用（真 pytest 已在 sys.modules）。
+    - `force=True`：**无条件**用替身覆盖。`--local` 模式必须这样：真 pytest 包装过的
+      夹具不允许被直接调用（会抛 "Fixture ... called directly"），而本运行器正是靠
+      "直接调用夹具函数"来执行的 —— 两种语义不兼容，只能二选一。
     """
-    try:
-        import pytest  # noqa: F401,PLC0415
-    except ImportError:
-        if str(TESTS_DIR) not in sys.path:
-            sys.path.insert(0, str(TESTS_DIR))
-        import _pytest_stub  # noqa: PLC0415
+    if not force:
+        try:
+            import pytest  # noqa: F401,PLC0415
+            return
+        except ImportError:
+            pass
 
-        sys.modules["pytest"] = _pytest_stub
-        print("未检测到 pytest，已启用 tests/_pytest_stub.py（见该文件顶部说明）。")
+    if str(TESTS_DIR) not in sys.path:
+        sys.path.insert(0, str(TESTS_DIR))
+    import _pytest_stub  # noqa: PLC0415
+
+    sys.modules["pytest"] = _pytest_stub
+    print(
+        "使用内置替身运行（tests/_pytest_stub.py）。"
+        if force
+        else "未检测到 pytest，已启用 tests/_pytest_stub.py（见该文件顶部说明）。"
+    )
+
+
+def _expand_parametrize(spec: Any) -> list[dict[str, Any]]:
+    """把替身记录的 `(argnames, argvalues)` 展开成一组 kwargs。
+
+    没有标记时返回 `[{}]`（即"一个用例、无额外参数"）。
+    """
+    if not spec:
+        return [{}]
+
+    argnames, argvalues = spec
+    if isinstance(argnames, str):
+        names = [part.strip() for part in argnames.split(",") if part.strip()]
+    else:
+        names = [str(part).strip() for part in argnames]
+
+    cases: list[dict[str, Any]] = []
+    for value in argvalues:
+        if len(names) == 1:
+            values: tuple[Any, ...] = (value,)
+        elif isinstance(value, (tuple, list)):
+            values = tuple(value)
+        else:
+            values = (value,)
+        cases.append(dict(zip(names, values)))
+    return cases
 
 
 def _run_local() -> int:
     os.environ.setdefault("PYTHONPATH", str(SRC_DIR))
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
-    _install_pytest_stub()
+    _install_pytest_stub(force=True)
 
     module_paths = [TESTS_DIR / "conftest.py"]
     module_paths += sorted(p for p in TESTS_DIR.glob("test_*.py") if p.is_file())
@@ -189,36 +230,51 @@ def _run_local() -> int:
 
     fixtures = {**_make_fixtures(), **_collect_fixtures(modules)}
 
-    passed = failed = 0
+    passed = failed = skipped = 0
     failures: list[str] = []
 
     for module in test_modules:
         for name, obj in vars(module).items():
             if not (name.startswith("test_") and callable(obj)):
                 continue
-            params = list(inspect.signature(obj).parameters)
-            patch = MonkeyPatch()
-            try:
-                kwargs = {}
-                for param in params:
-                    if param == "monkeypatch":
-                        kwargs[param] = patch
-                    else:
-                        kwargs[param] = _resolve(fixtures, param)
-                obj(**kwargs)
-            except Exception as exc:
-                failed += 1
+            # 一个测试函数可能被 parametrize 展开成多个用例
+            cases = _expand_parametrize(getattr(obj, "_booksoul_parametrize", None))
+            for case in cases:
                 label = f"{module.__name__}::{name}"
-                failures.append(label)
-                print(f"FAILED {label}: {type(exc).__name__}: {exc}")
-                traceback.print_exc()
-            else:
-                passed += 1
-            finally:
-                patch.undo()
+                if case:
+                    label += "[" + ",".join(str(value)[:20] for value in case.values()) + "]"
+                patch = MonkeyPatch()
+                try:
+                    kwargs: dict[str, Any] = {}
+                    for param in inspect.signature(obj).parameters:
+                        if param in case:
+                            continue  # 该参数由 parametrize 提供
+                        if param == "monkeypatch":
+                            kwargs[param] = patch
+                        else:
+                            kwargs[param] = _resolve(fixtures, param)
+                    obj(**kwargs, **case)
+                except BaseException as exc:  # noqa: BLE001
+                    # `pytest.skip` 抛的是 BaseException 子类（Skipped 继承 OutcomeException），
+                    # 用 `except Exception` 抓不住 —— 早期版本因此整个运行器崩掉。
+                    if isinstance(exc, KeyboardInterrupt):
+                        raise
+                    if type(exc).__name__ == "Skipped":
+                        skipped += 1
+                        print(f"SKIPPED {label}: {exc}")
+                    else:
+                        failed += 1
+                        failures.append(label)
+                        print(f"FAILED {label}: {type(exc).__name__}: {exc}")
+                        traceback.print_exc()
+                else:
+                    passed += 1
+                finally:
+                    patch.undo()
 
     print(f"\n{'=' * 60}")
-    print(f"内置运行器：{passed} passed, {failed} failed（共 {passed + failed} 个用例）")
+    total = passed + failed + skipped
+    print(f"内置运行器：{passed} passed, {skipped} skipped, {failed} failed（共 {total} 个用例）")
     if failures:
         print("失败用例：")
         for label in failures:

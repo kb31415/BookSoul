@@ -95,6 +95,10 @@ _CHAPTER_FALSE_FRIEND_RE = re.compile(
 #: 标题后面不该紧跟的汉字（"第一章节"）
 _NOT_A_TITLE = re.compile(r"^[章节回篇卷集幕]")
 _CJK = re.compile(r"[\u4e00-\u9fff]")
+#: 标题里不该出现的**句末**标点 —— "第一章正文。" / "序章正文。" 是正文句子，
+#: 不是标题（真实章节标题不带句号）。注意**不含**半角句点 `.`：它是合法的
+#: 标题分隔符（"第一章.雨夜" 要认）。
+_TITLE_FORBIDDEN_PUNCT = re.compile(r"[。！？；!?;]")
 
 # ── 清洗：盗版站广告行 ──
 # 原则：**只做确定性清洗，不猜语义**。误删正文比留噪声严重得多，所以
@@ -309,6 +313,9 @@ def find_chapter_title(line: str) -> str | None:
         # "最后一章里他死了。" / "下一章见。" —— 以虚词开头又紧跟汉字的，是句子
         if _CHAPTER_FALSE_FRIEND_RE.match(tail):
             return None
+        # "第一章正文。" —— 标题部分带句末标点，是正文句子（真实标题不带句号）
+        if _TITLE_FORBIDDEN_PUNCT.search(tail):
+            return None
         return stripped
 
     match = _SPECIAL_PATTERN.match(stripped)
@@ -317,6 +324,9 @@ def find_chapter_title(line: str) -> str | None:
         # "序章的写法他改了三遍。" —— 紧跟汉字、后缀又太长，那是句子不是标题；
         # 而 "番外 之后的事"（后缀 5 字）这种真标题要留下。
         if _CJK.match(suffix) and len(suffix) > _SPECIAL_SUFFIX_MAX:
+            return None
+        # "序章正文。" —— 同理：带句末标点的是正文句子
+        if _TITLE_FORBIDDEN_PUNCT.search(suffix):
             return None
         return stripped
     return None
