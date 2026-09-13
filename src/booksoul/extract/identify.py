@@ -33,13 +33,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from booksoul.ingest import Chapter, Novel, split_text
 from booksoul.llm import LLMClient, LLMUsage
+from booksoul.prompts import load_prompt, render_prompt
 from booksoul.storage import ChapterNameCache, RepositorySet
 
 __all__ = [
-    "ALIAS_SYSTEM_PROMPT",
     "DEFAULT_CHAPTER_CHAR_LIMIT",
     "DEFAULT_TOP_N",
-    "NAME_SYSTEM_PROMPT",
     "Candidate",
     "CandidateList",
     "ChapterScanResult",
@@ -68,57 +67,28 @@ DEFAULT_TOP_N: int = 15
 CONTEXT_SENTENCES: int = 3
 
 
-# ══════════════════════════ Prompt 原文（照搬设计）══════════════════════════
-
-#: `PROMPT_DESIGN.md` §3 Prompt 1 的固定部分。
-NAME_SYSTEM_PROMPT = """你是中文小说人物识别专家。
-
-【任务】
-从下面的章节文本中，提取所有出现的**人物名称**。
-
-【规则】
-1. 只提取人物（角色），不提取地名、门派、组织、物品、动物（拟人化角色除外）。
-2. 包括：本名、小名、绰号、尊称（如"沈师兄"）、亲属称谓（如"王婆婆"）。
-3. 不提取泛称：如"众人""路人""一个男人""那女子"。
-4. 同一章中重复出现的名字只输出一次。
-5. 只输出 JSON，不要任何解释文字。
-
-【输出格式】
-{"characters": ["沈知舟", "沈师兄", "林晚", "王婆婆"]}"""
-
-#: `PROMPT_DESIGN.md` §4 Prompt 2 的固定部分（`{name_contexts}` 由调用方拼）。
-ALIAS_SYSTEM_PROMPT = """你是中文小说人物分析专家。
-
-【任务】
-判断下面这些名称中，哪些**指代同一个人物**。
-
-【规则】
-1. **只有在证据充分时才合并**（如文中明确"沈师兄"就是"沈知舟"）。
-2. 不同人物可能同姓，**不要因为姓氏相同就合并**。
-3. 拿不准就不要合并——**宁可漏合并，不可错合并**。
-4. 每组给一个主名（取最完整的全名），其余作为别名。
-5. 只输出 JSON，不要任何解释文字。
-
-【输出格式】
-{"groups": [
-  {"main": "沈知舟", "aliases": ["沈师兄", "知舟"]},
-  {"main": "林晚", "aliases": ["晚晚"], "reason": "第7章：林晚小名晚晚"}
-]}"""
+# ══════════════════════════ Prompt（模板文件，照搬设计）══════════════════════════
+#
+# 模板放在 `prompts/*.md`，不是硬编码在代码里 —— `PROMPT_DESIGN.md` §11 明确要求
+# 「落到代码时，Prompt 作为 .md 文件读取（便于随时改，不用改代码）」。
+#
+# 四个 Prompt 里，本模块用前两个；模板里的 `{chapter_title}` / `{chapter_text}` /
+# `{name_contexts}` 由下面两个 builder 填充，其余花括号（JSON 示例、`{{user}}`）
+# 原样保留 —— 见 `booksoul.prompts` 的说明。
 
 
 def build_name_prompt(chapter_title: str, chapter_text: str) -> str:
-    """Prompt 1 的 user 部分：把章节标题与正文填进模板（§3）。"""
-    return (
-        "【章节标题】"
-        f"{chapter_title or '（无标题）'}\n"
-        "【章节文本】\n"
-        f"{chapter_text}"
+    """Prompt 1 的完整文本：章节标题 + 正文（§3）。"""
+    return render_prompt(
+        "identify_names",
+        chapter_title=chapter_title or "（无标题）",
+        chapter_text=chapter_text,
     )
 
 
 def build_alias_prompt(name_contexts: str) -> str:
     """Prompt 2 的 user 部分：候选名称及其上下文（§4）。"""
-    return f"【候选名称及上下文】\n{name_contexts}"
+    return render_prompt("merge_aliases", name_contexts=name_contexts)
 
 
 # ══════════════════════════ 输出解析 ══════════════════════════
@@ -304,11 +274,7 @@ def scan_chapter(
     chunks = _chunk_chapter(chapter, char_limit)
     results: list[list[str]] = []
     for chunk in chunks:
-        response = client.complete(
-            NAME_SYSTEM_PROMPT,
-            build_name_prompt(chapter.title, chunk),
-            json_mode=True,
-        )
+        response = client.complete("", build_name_prompt(chapter.title, chunk), json_mode=True)
         try:
             results.append(parse_names(response.json()))
         except (ValueError, TypeError):
@@ -479,7 +445,7 @@ def merge_aliases(
         lines.append(f"- {name}：{marks or '（无上下文）'}")
     prompt = build_alias_prompt("\n".join(lines))
 
-    response = client.complete(ALIAS_SYSTEM_PROMPT, prompt, json_mode=True)
+    response = client.complete("", build_alias_prompt("\n".join(lines)), json_mode=True)
     try:
         groups = parse_alias_groups(response.json())
     except (ValueError, TypeError):

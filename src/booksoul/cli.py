@@ -144,6 +144,108 @@ def identify(
     console.print(f"[dim]产物：data/cards/{book_id}/candidates.json[/dim]")
 
 
+@app.command("extract")
+def extract(
+    book_id: str = typer.Argument(..., help="`ingest` 产出的 book_id"),
+    character: str = typer.Argument(..., help="角色主名（同 `identify` 结果里的名字）"),
+    aliases: str = typer.Option("", "--aliases", "-a", help="别名，逗号分隔（强烈建议给：检索召回靠它）"),
+    max_passage_chars: int = typer.Option(5000, "--max-passage-chars", help="单次喂入的相关段落上限"),
+    generate: bool = typer.Option(True, "--generate/--no-generate", help="是否跑 Prompt 4 生成 first_mes"),
+) -> None:
+    """抽取指定角色的立体字段（阶段 4，🔴 风险点）。"""
+    from rich.panel import Panel
+
+    from booksoul.assemble import relationships_by_target
+    from booksoul.extract import extract_character, generate_card_fields
+    from booksoul.ingest import from_novel_record
+    from booksoul.llm import LLMClient
+
+    settings = load_settings()
+    repositories = build_repositories(settings)
+
+    record = repositories.novels.load(book_id)
+    if record is None:
+        console.print(f"[red]没有这本书[/red]: {book_id}（先跑 `booksoul ingest`）")
+        raise typer.Exit(code=1)
+
+    novel = from_novel_record(record)
+    alias_list = [item.strip() for item in aliases.split(",") if item.strip()]
+    client = LLMClient.from_settings(settings)
+
+    with console.status(f"逐章抽取「{character}」的 persona 增量……"):
+        merged, report = extract_character(
+            novel, client, character, alias_list, max_passage_chars=max_passage_chars
+        )
+
+    persona = merged.persona
+    table = Table(title=f"{character} —— persona（{report.chapter_hit}/{report.chapter_total} 章命中）")
+    table.add_column("字段")
+    table.add_column("内容")
+    table.add_column("长度", justify="right")
+    labels = {
+        "personality": "性格",
+        "desire": "欲望",
+        "flaw": "缺陷",
+        "secret": "秘密",
+        "speech_style": "说话风格",
+    }
+    for name, label in labels.items():
+        value = getattr(persona, name)
+        table.add_row(label, value or "[dim]（空）[/dim]", str(len(value)))
+    console.print(table)
+
+    if persona.relationships:
+        console.print("\n[bold]关系变化[/bold]")
+        for target, changes in relationships_by_target(persona).items():
+            console.print(f"  {target}：{' → '.join(changes)}")
+
+    if persona.speech_samples:
+        console.print("\n[bold]原话素材[/bold]")
+        for sample in persona.speech_samples[:8]:
+            console.print(f"  · {sample}")
+
+    if persona.quotes:
+        console.print(f"\n[bold]原文依据[/bold]（{len(persona.quotes)} 条）")
+        for quote in persona.quotes[:8]:
+            console.print(f"  [{quote.confidence}] {quote.field}：{quote.text[:40]}")
+
+    if merged.timeline.points:
+        console.print("\n[bold]时间线（成长弧光素材）[/bold]")
+        for point in merged.timeline.points[:8]:
+            arrow = f"{point.previous} → " if point.previous else ""
+            console.print(f"  第 {point.chapter_index} 章 {point.field}：{arrow}{point.value[:30]}")
+
+    if report.has_problems:
+        console.print("\n[yellow]质量校验告警[/yellow]")
+        if report.cleared_fields:
+            console.print(f"  置空（无原文依据）：{'、'.join(report.cleared_fields)}")
+        if report.ungrounded_fields:
+            console.print(f"  引用未落实（保留待人工确认）：{'、'.join(report.ungrounded_fields)}")
+        if report.dropped_quotes:
+            console.print(f"  丢弃假引用 {len(report.dropped_quotes)} 条：{report.dropped_quotes[0][:50]}")
+        if report.cliches:
+            console.print(f"  套话：{'；'.join(report.cliches)}")
+        if report.field_length_warnings:
+            console.print(f"  长度越界：{'；'.join(report.field_length_warnings)}")
+
+    if generate:
+        with console.status("生成 first_mes / mes_example（Prompt 4）……"):
+            fields = generate_card_fields(client, character, persona)
+        console.print(Panel(fields.first_mes or "[dim]（空）[/dim]", title="first_mes（开场白 / 钩子）"))
+        console.print(Panel(fields.mes_example or "[dim]（空）[/dim]", title="mes_example（原话 few-shot）"))
+
+    usage = client.usage.as_dict()
+    console.print(
+        f"\n调用 {usage['calls']} 次（失败 {usage['failed_calls']}）｜"
+        f"prompt {usage['prompt_tokens']} + completion {usage['completion_tokens']} "
+        f"= {usage['total_tokens']} tokens（缓存命中 {usage['cached_tokens']}）"
+    )
+    console.print(
+        "[yellow]人工把关点[/yellow]：阶段 4 是 MVP 第一风险点 —— "
+        "请检查上面的字段是否「像书中人」（不是通用套话）。"
+    )
+
+
 def main() -> None:  # pragma: no cover - 入口包装
     app()
 

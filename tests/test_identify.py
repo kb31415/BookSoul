@@ -13,10 +13,8 @@ from typing import Any
 import pytest
 
 from booksoul.extract import (
-    ALIAS_SYSTEM_PROMPT,
     DEFAULT_CHAPTER_CHAR_LIMIT,
     DEFAULT_TOP_N,
-    NAME_SYSTEM_PROMPT,
     build_alias_prompt,
     build_name_prompt,
     chapter_cache_fingerprint,
@@ -93,18 +91,27 @@ def test_name_prompt_handles_missing_title() -> None:
 
 
 def test_alias_prompt_wraps_contexts() -> None:
-    assert build_alias_prompt("- 沈知舟：①「甲」") == "【候选名称及上下文】\n- 沈知舟：①「甲」"
+    prompt = build_alias_prompt("- 沈知舟：①「甲」")
+
+    assert prompt.startswith("你是中文小说人物分析专家。")
+    assert prompt.rstrip().endswith("【候选名称及上下文】\n- 沈知舟：①「甲」")
 
 
 def test_system_prompts_match_prompt_design() -> None:
-    """提示词是设计定稿的原文，实现方不得改写（HANDOFF.md §0）。"""
-    assert NAME_SYSTEM_PROMPT.startswith("你是中文小说人物识别专家。")
-    assert '不提取泛称：如"众人""路人"' in NAME_SYSTEM_PROMPT
-    assert '{"characters": ["沈知舟", "沈师兄", "林晚", "王婆婆"]}' in NAME_SYSTEM_PROMPT
+    """提示词来自 `prompts/*.md`（设计 §11：模板读文件，不硬编码），措辞逐字一致。
 
-    assert ALIAS_SYSTEM_PROMPT.startswith("你是中文小说人物分析专家。")
-    assert "宁可漏合并，不可错合并" in ALIAS_SYSTEM_PROMPT
-    assert '"main": "沈知舟", "aliases": ["沈师兄", "知舟"]' in ALIAS_SYSTEM_PROMPT
+    阶段 3 原本把 Prompt 1/2 硬编码在代码里，后改为模板加载 —— 更贴合设计，
+    也让"改 prompt 不用改代码"成立。
+    """
+    names = build_name_prompt("第一章", "正文")
+    assert names.startswith("你是中文小说人物识别专家。")
+    assert '不提取泛称：如"众人""路人"' in names
+    assert '{"characters": ["沈知舟", "沈师兄", "林晚", "王婆婆"]}' in names
+
+    aliases = build_alias_prompt("- 沈知舟：①「甲」")
+    assert aliases.startswith("你是中文小说人物分析专家。")
+    assert "宁可漏合并，不可错合并" in aliases
+    assert '"main": "沈知舟", "aliases": ["沈师兄", "知舟"]' in aliases
 
 
 # ────────────────────────── 输出解析 ──────────────────────────
@@ -184,9 +191,12 @@ def test_scan_chapter_sends_title_and_text() -> None:
 
     cache = scan_chapter(client, chapter)
 
-    assert captured[0]["messages"][0]["content"] == NAME_SYSTEM_PROMPT
-    assert "第一章 雨夜" in captured[0]["messages"][1]["content"]
-    assert "沈知舟立在廊下。" in captured[0]["messages"][1]["content"]
+    # Prompt 1 的模板把"你是……"和章节内容放在同一个文本里 →
+    # system 消息为空，全部内容在 user 消息里
+    content = captured[0]["messages"][1]["content"]
+    assert content.startswith("你是中文小说人物识别专家。")
+    assert "第一章 雨夜" in content
+    assert "沈知舟立在廊下。" in content
     assert captured[0]["response_format"] == {"type": "json_object"}
     assert cache.chapter_index == 0
     assert cache.names == ["沈知舟"]
@@ -520,7 +530,7 @@ def test_merge_aliases_builds_context_block() -> None:
     merge_aliases(client, {"沈知舟": ["沈知舟立在廊下。", "沈知舟摇头。"]})
 
     user = captured["messages"][1]["content"]
-    assert captured["messages"][0]["content"] == ALIAS_SYSTEM_PROMPT
+    assert user.startswith("你是中文小说人物分析专家。")
     assert "【候选名称及上下文】" in user
     assert "- 沈知舟：" in user
     assert "①沈知舟立在廊下。" in user

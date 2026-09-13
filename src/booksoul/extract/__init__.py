@@ -2,13 +2,31 @@
 
 - `identify.py`（阶段 3）：逐章粗扫人名 → 汇总词频 → 候选列表 + 别名归并
 - `extract.py`（阶段 4，🔴 风险点 1）：按相关段落精抽立体字段 + 原文引用依据
+  （Prompt 3 逐章增量、Prompt 4 生成 `first_mes` / `mes_example`）
+- 合并（§7）与质量校验（§8）在 `booksoul.assemble`（按 `PROMPT_DESIGN.md` §11 的交付接口）
 """
 
+from booksoul.extract.extract import (
+    DEFAULT_PARAGRAPH_HINT,
+    CardFields,
+    ExtractionReport,
+    batch_passages,
+    build_persona_prompt,
+    empty_persona_summary,
+    extract_character,
+    extract_chapter_increments,
+    extract_persona_for_chapter,
+    format_persona_summary,
+    generate_card_fields,
+    parse_card_fields,
+    parse_persona_increment,
+    retrieve_passages,
+    score_passages,
+    split_paragraphs,
+)
 from booksoul.extract.identify import (
-    ALIAS_SYSTEM_PROMPT,
     DEFAULT_CHAPTER_CHAR_LIMIT,
     DEFAULT_TOP_N,
-    NAME_SYSTEM_PROMPT,
     Candidate,
     CandidateList,
     CharacterGroup,
@@ -28,24 +46,38 @@ from booksoul.extract.identify import (
 )
 
 __all__ = [
-    "ALIAS_SYSTEM_PROMPT",
     "DEFAULT_CHAPTER_CHAR_LIMIT",
+    "DEFAULT_PARAGRAPH_HINT",
     "DEFAULT_TOP_N",
-    "NAME_SYSTEM_PROMPT",
     "Candidate",
     "CandidateList",
+    "CardFields",
     "CharacterGroup",
     "ChapterScanResult",
+    "ExtractionReport",
     "IdentifyReport",
+    "batch_passages",
     "build_alias_prompt",
     "build_name_prompt",
+    "build_persona_prompt",
     "chapter_cache_fingerprint",
+    "empty_persona_summary",
+    "extract_character",
+    "extract_chapter_increments",
+    "extract_persona_for_chapter",
+    "format_persona_summary",
+    "generate_card_fields",
     "identify_candidates",
     "identify_chapters",
     "merge_aliases",
     "parse_alias_groups",
+    "parse_card_fields",
     "parse_names",
+    "parse_persona_increment",
     "rank_candidates",
+    "retrieve_passages",
     "sample_contexts",
     "scan_chapter",
+    "score_passages",
+    "split_paragraphs",
 ]
