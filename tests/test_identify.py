@@ -15,15 +15,24 @@ import pytest
 from booksoul.extract import (
     DEFAULT_CHAPTER_CHAR_LIMIT,
     DEFAULT_TOP_N,
+    Candidate,
+    CharacterGroup,
+    apply_forbidden_merges,
     build_alias_prompt,
     build_name_prompt,
     chapter_cache_fingerprint,
+    collect_contexts,
+    filter_merge_input,
+    find_family_relations,
+    forbidden_merges,
     identify_candidates,
     identify_chapters,
     merge_aliases,
+    normalise_names,
     parse_alias_groups,
     parse_names,
     rank_candidates,
+    resolve_source_form,
     sample_contexts,
     scan_chapter,
 )
@@ -509,7 +518,7 @@ def test_merge_aliases_returns_groups() -> None:
         ]
     )
 
-    groups = merge_aliases(
+    groups, notes = merge_aliases(
         client,
         {"沈知舟": ["沈知舟立在廊下。"], "沈师兄": ["沈师兄，你今日不去么？"]},
     )
@@ -517,6 +526,7 @@ def test_merge_aliases_returns_groups() -> None:
     assert len(groups) == 1, "只保留真正发生合并的组"
     assert groups[0].main == "沈知舟"
     assert groups[0].aliases == ["沈师兄", "知舟"]
+    assert notes == []
 
 
 def test_merge_aliases_builds_context_block() -> None:
@@ -527,7 +537,11 @@ def test_merge_aliases_builds_context_block() -> None:
         return fake_response('{"groups": []}')
 
     client = LLMClient(api_key="sk", model="m", completion_fn=fake, sleep_fn=lambda _: None)
-    merge_aliases(client, {"沈知舟": ["沈知舟立在廊下。", "沈知舟摇头。"]})
+    # 至少两个候选才会真调用（P0-2 过滤后 <2 就直接返回）
+    merge_aliases(
+        client,
+        {"沈知舟": ["沈知舟立在廊下。", "沈知舟摇头。"], "沈师兄": ["沈师兄，你今日不去么？"]},
+    )
 
     user = captured["messages"][1]["content"]
     assert user.startswith("你是中文小说人物分析专家。")
@@ -546,14 +560,264 @@ def test_merge_aliases_empty_input_makes_no_call() -> None:
 
     client = LLMClient(api_key="sk", model="m", completion_fn=fake, sleep_fn=lambda _: None)
 
-    assert merge_aliases(client, {}) == []
+    groups, notes = merge_aliases(client, {})
+    assert groups == []
+    assert notes == []
     assert calls["count"] == 0
 
 
 def test_merge_aliases_handles_unparsable_output() -> None:
     client = make_client([fake_response("模型没按格式输出")])
 
-    assert merge_aliases(client, {"甲": ["甲在此。"]}) == []
+    groups, _ = merge_aliases(client, {"甲": ["甲在此。"]})
+
+    assert groups == []
+
+
+# ────────────────── P0-2：上下文可用性守卫 ──────────────────
+
+
+def test_merge_aliases_skips_candidates_without_contexts() -> None:
+    """P0-2：`contexts` 为空的候选**不参与归并**（没依据就不要判）。
+
+    实测锚点：繁简摇摆导致 `司空学士`（简体）在繁体原文里精确匹配 0 次 →
+    contexts 为空。这类候选送进去只会让模型瞎猜。
+    """
+    captured: dict[str, Any] = {}
+
+    def fake(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return fake_response('{"groups": []}')
+
+    client = LLMClient(api_key="sk", model="m", completion_fn=fake, sleep_fn=lambda _: None)
+    _, notes = merge_aliases(
+        client,
+        {
+            "司空學士": ["司空學士的花園，十分齊整。"],
+            "司空学士": [],  # 繁简摇摆产生的空上下文候选
+            "温氏": [],  # 同理
+            "趙白": ["趙白少年儒雅。"],  # 留一个有上下文的，保证过滤后仍 ≥2 个
+        },
+    )
+
+    prompt = captured["messages"][1]["content"]
+    assert "司空學士" in prompt
+    assert "趙白" in prompt
+    assert "司空学士" not in prompt
+    assert "温氏" not in prompt
+    assert len(notes) == 2
+    assert any("司空学士" in note for note in notes)
+
+
+def test_merge_aliases_returns_empty_when_under_two_candidates() -> None:
+    """剔掉无上下文的之后不足两个 → 根本没法判归并，直接返回。"""
+    calls = {"count": 0}
+
+    def fake(**_: Any) -> Any:
+        calls["count"] += 1
+        return fake_response('{"groups": []}')
+
+    client = LLMClient(api_key="sk", model="m", completion_fn=fake, sleep_fn=lambda _: None)
+
+    groups, notes = merge_aliases(client, {"甲": ["甲在此。"], "乙": []})
+
+    assert (groups, notes) == ([], ["跳过无上下文的候选：乙"])
+    assert calls["count"] == 0
+
+
+def test_filter_merge_input_separates_empty_contexts() -> None:
+    kept, dropped = filter_merge_input({"甲": ["句子"], "乙": [], "丙": ["句子"]})
+
+    assert set(kept) == {"甲", "丙"}
+    assert dropped == ["乙"]
+
+
+# ────────────────── P0-3：关系句守卫（真实案例锚点）──────────────────
+
+#: 《宛如约》里的原句 —— 这一句是整个 bug 的源头。
+FATHER_SON_SENTENCE = (
+    "原來司空學士這個大兒子叫做司空約，表字默愛。"
+    "司空約道：「孩兒要說，父親大人又要責備孩兒狂妄。」"
+)
+
+
+def test_find_family_relations_detects_father_son() -> None:
+    relations = find_family_relations(FATHER_SON_SENTENCE)
+
+    assert relations, "应识别出「A 的大兒子叫做 B」这类关系句"
+    flattened = [(a, kin, b) for a, kin, b in relations]
+    assert any("司空學士" in a and "兒子" in kin and "司空約" in b for a, kin, b in flattened)
+
+
+def test_forbidden_merges_blocks_father_and_son() -> None:
+    """锚点回归：司空學士 与 司空約 **不得**被合并（真实语料里是父子）。"""
+    chapters = [make_chapter(0, "第0章", FATHER_SON_SENTENCE)]
+
+    forbidden = forbidden_merges(["司空學士", "司空約"], chapters)
+
+    assert frozenset({"司空學士", "司空約"}) in forbidden
+    assert "兒子" in forbidden[frozenset({"司空學士", "司空約"})]
+
+
+def test_forbidden_merges_empty_for_unrelated_names() -> None:
+    chapters = [make_chapter(0, "第0章", "沈知舟立在廊下，一言不发。林晚撑伞走近。")]
+
+    assert forbidden_merges(["沈知舟", "林晚"], chapters) == {}
+
+
+def test_forbidden_merges_requires_both_names_present() -> None:
+    chapters = [make_chapter(0, "第0章", FATHER_SON_SENTENCE)]
+
+    # 只给一个名字，凑不成对
+    assert forbidden_merges(["司空學士"], chapters) == {}
+    assert forbidden_merges([], chapters) == {}
+
+
+def test_forbidden_merges_detects_simplified_relation_too() -> None:
+    """简体关系句同样要认（LLM 逐章可能在繁简之间摇摆）。"""
+    chapters = [make_chapter(0, "第0章", "林晚的父親名叫林正，一向严厉。")]
+
+    forbidden = forbidden_merges(["林晚", "林正"], chapters)
+
+    assert frozenset({"林晚", "林正"}) in forbidden
+
+
+def test_apply_forbidden_merges_strips_only_the_violating_alias() -> None:
+    """只摘掉违反守卫的别名，组内其余别名保留。"""
+    groups = [
+        CharacterGroup(main="司空約", aliases=["司空學士", "默愛"]),
+    ]
+    forbidden = {frozenset({"司空約", "司空學士"}): "司空學士…大兒子…司空約"}
+
+    filtered, notes = apply_forbidden_merges(groups, forbidden)
+
+    assert len(filtered) == 1
+    assert filtered[0].aliases == ["默愛"]
+    assert len(notes) == 1
+    assert "司空學士" in notes[0]
+
+
+def test_apply_forbidden_merges_drops_group_when_all_aliases_rejected() -> None:
+    groups = [CharacterGroup(main="甲", aliases=["乙"])]
+
+    filtered, notes = apply_forbidden_merges(groups, {frozenset({"甲", "乙"}): "证据"})
+
+    assert filtered == []
+    assert len(notes) == 1
+
+
+def test_merge_aliases_applies_forbidden_guard() -> None:
+    """端到端：LLM 说要合并父子，守卫必须拦下。"""
+    client = make_client(
+        [fake_response(json.dumps({"groups": [{"main": "司空約", "aliases": ["司空學士"]}]}, ensure_ascii=False))]
+    )
+    chapters = [make_chapter(0, "第0章", FATHER_SON_SENTENCE)]
+    forbidden = forbidden_merges(["司空約", "司空學士"], chapters)
+
+    groups, notes = merge_aliases(
+        client,
+        {"司空約": ["司空約道：「孩兒要說。」"], "司空學士": ["司空學士的花園十分齊整。"]},
+        forbidden=forbidden,
+    )
+
+    assert groups == [], "父子不得合并"
+    assert any("司空學士" in note for note in notes)
+
+
+# ────────────────── P0-1：字形归一（繁简摇摆）──────────────────
+
+
+def test_resolve_source_form_keeps_form_present_in_source() -> None:
+    chapters = [make_chapter(0, "第0章", "司空學士的花園十分齊整。")]
+
+    assert resolve_source_form("司空學士", chapters) == "司空學士"
+
+
+def test_resolve_source_form_maps_simplified_to_traditional() -> None:
+    """锚点回归：LLM 给简体「司空学士」，原文是繁体「司空學士」。"""
+    chapters = [make_chapter(0, "第0章", "司空學士的花園十分齊整。")]
+
+    assert resolve_source_form("司空学士", chapters) == "司空學士"
+
+
+def test_resolve_source_form_maps_traditional_to_simplified_source() -> None:
+    chapters = [make_chapter(0, "第0章", "赵如子在廊下。")]
+
+    assert resolve_source_form("趙如子", chapters) == "赵如子"
+
+
+def test_resolve_source_form_unknown_name_returns_as_is() -> None:
+    chapters = [make_chapter(0, "第0章", "司空學士的花園。")]
+
+    assert resolve_source_form("查无此人", chapters) == "查无此人"
+
+
+def test_normalise_names_merges_variants_across_chapters() -> None:
+    """锚点回归：第 0 章输出简体、第 1 章输出繁体 → 归一后是同一个名字。"""
+    caches = [
+        ChapterNameCache.from_chunks(0, [["司空学士", "赵如子"]], "f0"),
+        ChapterNameCache.from_chunks(1, [["司空學士", "趙如子", "司空約"]], "f1"),
+    ]
+    chapters = [
+        make_chapter(0, "第0章", "司空學士與趙如子在此。"),
+        make_chapter(1, "第1章", "司空學士與趙如子、司空約在此。"),
+    ]
+
+    normalised, changed = normalise_names(caches, chapters)
+
+    assert changed == {"司空学士": "司空學士", "赵如子": "趙如子"}
+    assert normalised[0].names == ["司空學士", "趙如子"]
+    assert normalised[1].names == ["司空學士", "趙如子", "司空約"]
+
+
+def test_normalise_names_no_change_returns_same_objects() -> None:
+    caches = [ChapterNameCache.from_chunks(0, [["沈知舟"]], "f0")]
+    chapters = [make_chapter(0, "第0章", "沈知舟立在廊下。")]
+
+    normalised, changed = normalise_names(caches, chapters)
+
+    assert changed == {}
+    assert normalised == caches
+
+
+def test_normalise_names_accumulates_mentions_across_variants() -> None:
+    """归一后统计要把两个写法的出现**合并计数**（这是 P0-1 的核心收益）。"""
+    caches = [
+        ChapterNameCache.from_chunks(0, [["司空学士"], ["司空学士"]], "f0"),
+        ChapterNameCache.from_chunks(1, [["司空學士"]], "f1"),
+    ]
+    chapters = [
+        make_chapter(0, "第0章", "司空學士的花園。"),
+        make_chapter(1, "第1章", "司空學士的花園。"),
+    ]
+
+    normalised, _ = normalise_names(caches, chapters)
+    ranked = rank_candidates(normalised, chapters)
+
+    assert [c.name for c in ranked] == ["司空學士"]
+    assert ranked[0].chapter_count == 2
+    assert ranked[0].mentions == 3
+
+
+def test_collect_contexts_normalises_and_resolves_contexts() -> None:
+    """`collect_contexts` 要顺便把候选名校正成原文写法，并抽到非空上下文。"""
+    from booksoul.extract import Candidate
+
+    candidates = [Candidate(name="司空学士", chapter_count=1, mentions=1)]
+    chapters = [make_chapter(0, "第0章", "司空學士的花園十分齊整。")]
+
+    contexts = collect_contexts(candidates, chapters)
+
+    assert candidates[0].name == "司空學士"
+    assert contexts["司空學士"]
+    assert all("司空學士" in sentence for sentence in contexts["司空學士"])
+
+
+def test_simplify_only_replaces_known_characters() -> None:
+    from booksoul.extract import simplify
+
+    assert simplify("司空學士") == "司空学士"
+    assert simplify("甲乙丙") == "甲乙丙"  # 没有繁简差异的字保持原样
 
 
 # ────────────────────────── 缓存指纹 ──────────────────────────

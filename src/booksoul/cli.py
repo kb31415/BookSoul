@@ -94,7 +94,7 @@ def identify(
     merge: bool = typer.Option(True, "--merge/--no-merge", help="是否跑别名归并（Prompt 2）"),
 ) -> None:
     """逐章识别人名 → 候选人物列表（阶段 3）。"""
-    from booksoul.extract import identify_candidates, merge_aliases
+    from booksoul.extract import forbidden_merges, identify_candidates, merge_aliases
     from booksoul.ingest import from_novel_record
     from booksoul.llm import LLMClient
 
@@ -119,14 +119,29 @@ def identify(
     table.add_column("姓名")
     table.add_column("出现章数", justify="right")
     table.add_column("出现次数", justify="right")
+    table.add_column("上下文", justify="right")
     for rank, candidate in enumerate(payload.candidates, start=1):
-        table.add_row(str(rank), candidate.name, str(candidate.chapter_count), str(candidate.mentions))
+        table.add_row(
+            str(rank),
+            candidate.name,
+            str(candidate.chapter_count),
+            str(candidate.mentions),
+            str(len(candidate.contexts)),
+        )
     console.print(table)
 
+    if report.renamed:
+        console.print("\n[bold]字形归一（按原文校正）[/bold]")
+        for source, target in report.renamed.items():
+            console.print(f"  {source} → {target}")
+
     if merge and payload.candidates:
-        contexts = {c.name: c.contexts for c in payload.candidates}
+        names = [candidate.name for candidate in payload.candidates]
+        contexts = {candidate.name: candidate.contexts for candidate in payload.candidates}
+        # P0-3：关系句守卫（"A 的儿子是 B" 则禁止合并 A/B）
+        forbidden = forbidden_merges(names, novel.chapters)
         with console.status("别名归并中（Prompt 2）……"):
-            groups = merge_aliases(client, contexts)
+            groups, notes = merge_aliases(client, contexts, forbidden=forbidden)
         if groups:
             console.print("\n[bold]别名归并[/bold]")
             for group in groups:
@@ -134,6 +149,8 @@ def identify(
                 console.print(f"  {group.main} ← {'、'.join(group.aliases)}{reason}")
         else:
             console.print("\n[dim]没有需要合并的别名[/dim]")
+        for note in notes:
+            console.print(f"  [yellow]守卫[/yellow] {note}")
 
     usage = client.usage.as_dict()
     console.print(
