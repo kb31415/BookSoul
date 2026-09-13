@@ -26,6 +26,22 @@ from booksoul.schema import (  # noqa: E402  (必须在 sys.path 兜底之后导
 )
 
 
+@pytest.fixture(autouse=True)
+def no_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认关掉 config 的「用户级环境变量回退」。
+
+    为什么必须自动关：开发机（本机）上有真实的 `DEEPSEEK_API_KEY`，
+    不关的话"缺 Key 应该报错"这类用例会读到真实 Key 而失败 ——
+    测试必须与真实环境隔离。
+
+    要专门测回退行为的用例，自己 monkeypatch `booksoul.config.FALLBACK_PROVIDERS`
+    （见 `tests/test_config.py` 里的回退用例）。
+    """
+    import booksoul.config as config_module
+
+    monkeypatch.setattr(config_module, "FALLBACK_PROVIDERS", ())
+
+
 def make_full_card() -> CharacterCard:
     """带全部立体字段的角色卡（用于往返测试）。"""
     return CharacterCard(
@@ -243,26 +259,26 @@ def real_story_text() -> str:
     return make_real_story_text()
 
 
-# ────────────────────────── 沙箱友好的 tmp_path ──────────────────────────
-
-#: 用例临时目录的根。**刻意不用系统临时目录**：受限沙箱下 `tempfile.mkdtemp`
-#: 建出来的目录带受限 ACL，连自己都写不进去（pytest 内置的 `tmp_path` 正是这么
-#: 建的），表现为大量 setup ERROR。改成仓库内目录即可正常读写。
-_CASE_TMP_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "cases"
-_CASE_TMP_COUNTER = itertools.count()
+# ────────────────────────── 阶段 3：存储 ──────────────────────────
 
 
 @pytest.fixture()
-def tmp_path() -> Path:
-    """覆盖 pytest 内置的同名夹具，改用**仓库内**目录（沙箱可写）。
+def repos(tmp_path: Path):
+    """一套指向 tmp 的文件版 Repository（不碰真实 data/）。
 
-    conftest 中的夹具优先于插件提供的同名夹具，所以这一层覆盖是生效的。
-    `pyproject.toml` 里同时关掉了内置的 `tmpdir` 插件（`-p no:tmpdir`），
-    避免它再到系统临时目录建 basetemp 并在收尾清理时报权限错。
+    放在 conftest 而不是各测试文件里：`test_storage_repository.py` 与
+    `test_identify.py` 都要用它，各定义一份会互相覆盖。
     """
-    _CASE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    path = _CASE_TMP_ROOT / f"case-{os.getpid()}-{next(_CASE_TMP_COUNTER)}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    from booksoul.config import Settings
+    from booksoul.storage import build_repositories
+
+    return build_repositories(Settings(data_dir=tmp_path))
+
+
+# ────────────────────────── 沙箱友好的 tmp_path ──────────────────────────
+
+#: 用例临时目录的根（仅给**没有 pytest 时的兜底运行器**用，见 `tests/run_tests.py`）。
+#: 有 pytest 时一律用内置的 `tmp_path` / `tmp_path_factory`。
+_CASE_TMP_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "cases"
 
 

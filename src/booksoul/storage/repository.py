@@ -30,7 +30,13 @@ from typing import Any, Iterable, Iterator, Protocol, runtime_checkable
 
 from booksoul.config import Settings, load_settings
 from booksoul.schema import CharacterCard
-from booksoul.storage.models import MemoryEntry, NovelRecord, SessionLog, utc_now_iso
+from booksoul.storage.models import (
+    ChapterNameCache,
+    MemoryEntry,
+    NovelRecord,
+    SessionLog,
+    utc_now_iso,
+)
 
 __all__ = [
     "CardRepository",
@@ -128,13 +134,22 @@ class NovelRepository(Protocol):
 
 @runtime_checkable
 class CardRepository(Protocol):
-    """角色卡（阶段 4–5 产出，阶段 6 消费）。"""
+    """角色卡（阶段 4–5 产出，阶段 6 消费）+ 按章的中间产物缓存（阶段 3）。"""
 
     def save(self, card: CharacterCard, character_id: str | None = None) -> str: ...
     def load(self, character_id: str) -> CharacterCard | None: ...
     def exists(self, character_id: str) -> bool: ...
     def list_ids(self) -> list[str]: ...
     def delete(self, character_id: str) -> bool: ...
+
+    # ── 阶段 3：按章中间产物（`data/cards/{book_id}/chapters/{i}.names.json`）──
+
+    def character_dir(self, book_id: str) -> Path: ...
+    def save_chapter_names(self, book_id: str, cache: ChapterNameCache) -> Path: ...
+    def load_chapter_names(self, book_id: str, chapter_index: int) -> ChapterNameCache | None: ...
+    def load_all_chapter_names(self, book_id: str) -> dict[int, ChapterNameCache]: ...
+    def save_json(self, book_id: str, filename: str, payload: Any) -> Path: ...
+    def load_json(self, book_id: str, filename: str) -> Any | None: ...
 
 
 @runtime_checkable
@@ -201,7 +216,12 @@ class FileNovelRepository:
 
 
 class FileCardRepository:
-    """`data/cards/{character_id}.json`（`PROJECT_DESIGN.md` §13.6）。"""
+    """`data/cards/{character_id}.json`（`PROJECT_DESIGN.md` §13.6）。
+
+    另外管 `data/cards/{book_id}/` 下的按章中间产物 —— 这是阶段 3 的落盘位置
+    （`PROMPT_DESIGN.md` §3：`{book_id}/chapters/{i}.names.json`）。
+    路径拼接全部收敛在这里，业务代码只拿返回值。
+    """
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -256,6 +276,55 @@ class FileCardRepository:
         if not isinstance(raw, dict):
             return None
         return CharacterCard.from_tavern(raw)
+
+    # ── 阶段 3：按章中间产物 ──
+
+    def character_dir(self, book_id: str) -> Path:
+        """某本书的产物目录：`data/cards/{book_id}/`。"""
+        return self.root / _safe_id(book_id)
+
+    def _chapter_path(self, book_id: str, chapter_index: int) -> Path:
+        return self.character_dir(book_id) / "chapters" / f"{chapter_index}.names.json"
+
+    def save_chapter_names(self, book_id: str, cache: ChapterNameCache) -> Path:
+        target = self._chapter_path(book_id, cache.chapter_index)
+        _write_json(target, cache.model_dump(mode="json"))
+        return target
+
+    def load_chapter_names(self, book_id: str, chapter_index: int) -> ChapterNameCache | None:
+        raw = _read_json(self._chapter_path(book_id, chapter_index))
+        if not isinstance(raw, dict):
+            return None
+        return ChapterNameCache.model_validate(raw)
+
+    def load_all_chapter_names(self, book_id: str) -> dict[int, ChapterNameCache]:
+        """读回一本书全部已缓存的章节结果（章节按 index 升序）。"""
+        chapters_dir = self.character_dir(book_id) / "chapters"
+        if not chapters_dir.is_dir():
+            return {}
+
+        cached: dict[int, ChapterNameCache] = {}
+        for path in chapters_dir.glob("*.names.json"):
+            raw = _read_json(path)
+            if not isinstance(raw, dict):
+                continue
+            try:
+                cache = ChapterNameCache.model_validate(raw)
+            except Exception:  # noqa: BLE001 - 坏缓存跳过，让它重跑
+                continue
+            cached[cache.chapter_index] = cache
+        return dict(sorted(cached.items()))
+
+    def save_json(self, book_id: str, filename: str, payload: Any) -> Path:
+        """在 `data/cards/{book_id}/` 下落一个 JSON（如 `candidates.json`）。"""
+        filename = _safe_id(filename) + (".json" if not filename.endswith(".json") else "")
+        target = self.character_dir(book_id) / filename
+        _write_json(target, payload)
+        return target
+
+    def load_json(self, book_id: str, filename: str) -> Any | None:
+        filename = _safe_id(filename) + (".json" if not filename.endswith(".json") else "")
+        return _read_json(self.character_dir(book_id) / filename)
 
 
 class FileMemoryRepository:

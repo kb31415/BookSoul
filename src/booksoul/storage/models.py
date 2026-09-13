@@ -19,8 +19,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
-    "MEMORY_TIERS",
     "MEMORY_SOURCES",
+    "MEMORY_TIERS",
+    "ChapterNameCache",
     "MemoryEntry",
     "NovelRecord",
     "SessionLog",
@@ -107,3 +108,78 @@ class SessionLog(BaseModel):
     state: dict[str, Any] = Field(default_factory=dict)
     #: 会话消息。MVP 用 dict 保持灵活（对话消息的确切结构属阶段 6 设计范围）。
     messages: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ChapterNameCache(BaseModel):
+    """某一章的人名识别结果缓存（`data/cards/{book_id}/chapters/{i}.names.json`）。
+
+    对应 `PROMPT_DESIGN.md` §3 的「结果按章落盘缓存」。
+
+    **一章可能被再切成多块**（§3：建议单章不超过 6000 字，超出则再切分），
+    此时 `parts` 的元素是**每块的名字列表**；只有一块时元素就是名字字符串。
+    文件名始终按**原章号** `{i}` —— 一章一个文件，文件里装它的块。
+
+    `fingerprint` 是喂给模型的文本指纹：正文变了自动重跑，正文没变就跳过
+    （避免重复烧 token，`MVP_PLAN.md` §1 全局约定）。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    chapter_index: int
+    fingerprint: str = ""
+    parts: list[Any] = Field(default_factory=list)
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+    # ── 便捷视图 ──
+
+    @property
+    def chunks(self) -> list[list[str]]:
+        """把 `parts` 统一成「每块一个名字列表」。
+
+        需要区分两种形态（`from_chunks` 的压缩规则）：
+
+        - `parts = ["甲", "乙"]` —— **单块**压平了名字，是一个块
+        - `parts = [["甲"], ["乙"]]` —— 多块，两块各一个名字
+
+        判据是元素类型：全是字符串 → 单块；出现列表 → 多块。
+        """
+        if all(isinstance(part, str) for part in self.parts):
+            return [[name for name in self.parts if name.strip()]]
+
+        chunks: list[list[str]] = []
+        for part in self.parts:
+            if isinstance(part, (list, tuple)):
+                chunks.append([str(item) for item in part if str(item).strip()])
+        return chunks
+
+    @property
+    def names(self) -> list[str]:
+        """本章出现过的全部名字（跨块去重，保持首次出现顺序）。"""
+        seen: dict[str, None] = {}
+        for chunk in self.chunks:
+            for name in chunk:
+                seen.setdefault(name, None)
+        return list(seen)
+
+    @classmethod
+    def from_chunks(
+        cls,
+        chapter_index: int,
+        chunks: list[list[str]],
+        fingerprint: str,
+        updated_at: str | None = None,
+    ) -> "ChapterNameCache":
+        """由「每块的名字列表」构造。
+
+        只有一块时把 `parts` 压平成名字列表 —— 落盘更可读，也贴近
+        `PROMPT_DESIGN.md` 里 `{i}.names.json` 的朴素形状。
+        """
+        parts: list[Any] = chunks[0] if len(chunks) == 1 else chunks
+        payload: dict[str, Any] = {
+            "chapter_index": chapter_index,
+            "fingerprint": fingerprint,
+            "parts": parts,
+        }
+        if updated_at:
+            payload["updated_at"] = updated_at
+        return cls(**payload)

@@ -1,6 +1,6 @@
 """存储层（`MVP_PLAN.md` §1「迭代友好性约束」+ `HANDOFF.md` §2 结构红线）。
 
-- `models.py`：`NovelRecord` / `MemoryEntry` / `SessionLog` 数据契约
+- `models.py`：`NovelRecord` / `ChapterNameCache` / `MemoryEntry` / `SessionLog` 数据契约
 - `repository.py`：`NovelRepository` / `CardRepository` / `MemoryRepository` /
   `SessionRepository` 四个接口 + `FileXxxRepository` 文件实现 + `build_repositories()`
 
@@ -11,6 +11,7 @@
 from booksoul.storage.models import (
     MEMORY_SOURCES,
     MEMORY_TIERS,
+    ChapterNameCache,
     MemoryEntry,
     NovelRecord,
     SessionLog,
@@ -34,6 +35,7 @@ __all__ = [
     "MEMORY_SOURCES",
     "MEMORY_TIERS",
     "CardRepository",
+    "ChapterNameCache",
     "FileCardRepository",
     "FileMemoryRepository",
     "FileNovelRepository",

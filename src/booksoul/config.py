@@ -6,20 +6,27 @@
 - 配置在**使用时**读取（`load_settings()`），而不是 import 时固化 —— 便于测试
   与在同一进程里切换环境。
 - `DATA_DIR` 可用环境变量覆盖，默认 `<repo>/data`。
+- 取值顺序：**进程环境变量 → 平台回退**（Windows 用户级环境变量）。
+  回退是为了绕开"环境变量只对新进程生效"这个坑：用户设完 Key，
+  不必重启终端/编辑器就能用。
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 __all__ = [
+    "DATA_SUBDIRS",
     "DEFAULT_MODEL_NAME",
     "ENV_API_KEY",
     "ENV_DATA_DIR",
     "ENV_MODEL_NAME",
+    "FALLBACK_PROVIDERS",
     "Settings",
+    "env_value",
     "get_data_dir",
     "get_project_root",
     "load_settings",
@@ -36,6 +43,70 @@ ENV_DATA_DIR = "DATA_DIR"
 #: 数据目录下的固定子目录（阶段 2 起各阶段产物落盘位置）。
 DATA_SUBDIRS = ("novels", "cards", "sessions", "memory")
 
+#: 读取环境变量的函数签名（便于测试与后续换实现）。
+EnvProvider = Callable[[str], str | None]
+
+
+def _windows_user_env(name: str) -> str | None:
+    """读 Windows **用户级**环境变量（`SetEnvironmentVariable(..., "User")` 写的那层）。
+
+    为什么需要：环境变量只对**新启动的进程**可见。用户设好 Key 之后，
+    已经在跑的终端 / 编辑器里 `os.environ` 仍然看不到它。这里补一层回退，
+    让"设完就能用"。非 Windows 或读取失败一律返回 `None`（不影响主流程）。
+    """
+    if os.name != "nt":  # pragma: no cover - 仅在非 Windows 上分支
+        return None
+    try:
+        import winreg  # noqa: PLC0415 - 只在 Windows 上需要
+    except ImportError:  # pragma: no cover
+        return None
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _ = winreg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _fallback_providers() -> tuple[EnvProvider, ...]:
+    """进程环境变量之后，依次尝试的回退来源。
+
+    模块级常量 `FALLBACK_PROVIDERS` 存在的意义：**测试要能把回退关掉**，
+    否则有用户级 Key 的机器上，"缺 Key"的用例会读到真实 Key 而失败。
+    显式传 `()` 即可关掉（见 `tests/conftest.py` 的 `no_env_fallback`）。
+    """
+    return FALLBACK_PROVIDERS
+
+
+def _default_fallback_providers() -> tuple[EnvProvider, ...]:
+    if os.name == "nt":
+        return (_windows_user_env,)
+    return ()
+
+
+#: 回退来源；测试可替换为空元组以隔离真实环境。
+FALLBACK_PROVIDERS: tuple[EnvProvider, ...] = _default_fallback_providers()
+
+
+def env_value(name: str) -> str:
+    """按「进程环境变量 → 平台回退」取一个环境变量，返回 `str`（没有则 `""`）。
+
+    `load_settings()` / `get_data_dir()` 都走这里，保证行为一致。
+    """
+    value = os.environ.get(name)
+    if value:
+        return value.strip()
+
+    for provider in _fallback_providers():
+        try:
+            fallback = provider(name)
+        except Exception:  # noqa: BLE001 - 回退失败绝不能影响主流程
+            continue
+        if fallback:
+            return fallback.strip()
+    return ""
+
 
 def get_project_root() -> Path:
     """仓库根目录（`src/booksoul/config.py` 往上三层）。"""
@@ -44,7 +115,7 @@ def get_project_root() -> Path:
 
 def get_data_dir() -> Path:
     """数据根目录：环境变量 `DATA_DIR` 优先，否则 `<repo>/data`。"""
-    override = os.environ.get(ENV_DATA_DIR, "").strip()
+    override = env_value(ENV_DATA_DIR)
     if override:
         return Path(override).expanduser()
     return get_project_root() / "data"
@@ -100,10 +171,8 @@ def load_settings(
     data_dir: str | Path | None = None,
 ) -> Settings:
     """从环境变量装载配置；显式传参优先（便于测试与 CLI 覆盖）。"""
-    resolved_key = api_key if api_key is not None else os.environ.get(ENV_API_KEY, "")
-    resolved_model = model_name if model_name is not None else os.environ.get(
-        ENV_MODEL_NAME, ""
-    )
+    resolved_key = api_key if api_key is not None else env_value(ENV_API_KEY)
+    resolved_model = model_name if model_name is not None else env_value(ENV_MODEL_NAME)
     if data_dir is None:
         resolved_data = get_data_dir()
     else:
