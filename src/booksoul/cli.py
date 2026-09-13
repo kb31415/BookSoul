@@ -94,7 +94,12 @@ def identify(
     merge: bool = typer.Option(True, "--merge/--no-merge", help="是否跑别名归并（Prompt 2）"),
 ) -> None:
     """逐章识别人名 → 候选人物列表（阶段 3）。"""
-    from booksoul.extract import forbidden_merges, identify_candidates, merge_aliases
+    from booksoul.extract import (
+        forbidden_merges,
+        identify_candidates,
+        merge_aliases,
+        same_reference_merges,
+    )
     from booksoul.ingest import from_novel_record
     from booksoul.llm import LLMClient
 
@@ -138,10 +143,23 @@ def identify(
     if merge and payload.candidates:
         names = [candidate.name for candidate in payload.candidates]
         contexts = {candidate.name: candidate.contexts for candidate in payload.candidates}
-        # P0-3：关系句守卫（"A 的儿子是 B" 则禁止合并 A/B）
+        # 确定性证据（都不问 LLM）：
+        #   异指 —— 亲属关系句（"A 的大兒子叫做 B"）→ 禁止合并
+        #   同指 —— 原文点破（"和詩之趙如子即是趙白"）→ 应当合并
         forbidden = forbidden_merges(names, novel.chapters)
+        same_reference = same_reference_merges(names, novel.chapters, forbidden=forbidden)
         with console.status("别名归并中（Prompt 2）……"):
-            groups, notes = merge_aliases(client, contexts, forbidden=forbidden)
+            groups, notes = merge_aliases(
+                client,
+                contexts,
+                forbidden=forbidden,
+                same_reference=same_reference,
+            )
+        if same_reference:
+            console.print("\n[bold]同指证据[/bold]（原文直接陈述，强制合并）")
+            for pair, proof in same_reference.items():
+                left, right = sorted(pair)
+                console.print(f"  {left} = {right}   [dim]{proof}[/dim]")
         if groups:
             console.print("\n[bold]别名归并[/bold]")
             for group in groups:

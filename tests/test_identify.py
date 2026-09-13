@@ -17,14 +17,18 @@ from booksoul.extract import (
     DEFAULT_TOP_N,
     Candidate,
     CharacterGroup,
+    SAME_REFERENCE_MARKERS,
     apply_forbidden_merges,
+    apply_same_reference_merges,
     build_alias_prompt,
     build_name_prompt,
     chapter_cache_fingerprint,
     collect_contexts,
     filter_merge_input,
     find_family_relations,
+    find_same_reference_sentences,
     forbidden_merges,
+    format_same_reference_evidence,
     identify_candidates,
     identify_chapters,
     merge_aliases,
@@ -33,6 +37,7 @@ from booksoul.extract import (
     parse_names,
     rank_candidates,
     resolve_source_form,
+    same_reference_merges,
     sample_contexts,
     scan_chapter,
 )
@@ -818,6 +823,195 @@ def test_simplify_only_replaces_known_characters() -> None:
 
     assert simplify("司空學士") == "司空学士"
     assert simplify("甲乙丙") == "甲乙丙"  # 没有繁简差异的字保持原样
+
+
+# ────────────────── 同指证据（正向）：原文明说"这两个名字是同一个人" ──────────────────
+
+#: 《宛如约》原文 —— 直接点破"趙如子就是趙白"（女扮男装的化名）。
+SAME_PERSON_SENTENCE = "和詩之趙如子即是趙白。"
+#: 另一处：自我介绍用化名与表字。
+SAME_PERSON_SENTENCE_2 = "趙如子因打一恭道：「晚生趙白，賤字非玉。」"
+
+
+def test_find_same_reference_detects_explicit_statement() -> None:
+    found = find_same_reference_sentences(SAME_PERSON_SENTENCE)
+
+    assert found
+    assert any("趙如子" in a and "趙白" in b for a, _, b in found)
+
+
+def test_same_reference_merges_pairs_candidates() -> None:
+    """锚点回归：趙如子 / 趙白 必须被判定为**应当合并**（原文直接点破）。"""
+    chapters = [make_chapter(0, "第0章", SAME_PERSON_SENTENCE)]
+
+    evidence = same_reference_merges(["趙如子", "趙白"], chapters)
+
+    assert frozenset({"趙如子", "趙白"}) in evidence
+    assert "即是" in evidence[frozenset({"趙如子", "趙白"})]
+
+
+def test_same_reference_ignores_non_candidate_fragments() -> None:
+    """正则会在句子层面切出很多非人名片段，必须用候选名集合过滤掉。"""
+    chapters = [make_chapter(0, "第0章", "水縣小蓬萊山中有叫做列眉村。")]
+
+    assert same_reference_merges(["趙如子", "趙白"], chapters) == {}
+
+
+def test_same_reference_skips_substring_pairs() -> None:
+    """"如子" 是 "趙如子" 的子串 → 不算"两个名字同指"，跳过（否则造冗余对）。"""
+    chapters = [make_chapter(0, "第0章", SAME_PERSON_SENTENCE)]
+
+    evidence = same_reference_merges(["趙如子", "如子", "趙白"], chapters)
+
+    assert frozenset({"趙如子", "趙白"}) in evidence
+    assert frozenset({"如子", "趙白"}) not in evidence
+
+
+def test_same_reference_requires_exact_candidate_name() -> None:
+    chapters = [make_chapter(0, "第0章", SAME_PERSON_SENTENCE)]
+
+    assert same_reference_merges(["查无此人"], chapters) == {}
+
+
+def test_hetero_reference_wins_over_homo_reference() -> None:
+    """异指优先：同一对被判为父子就不允许再按同指合并。"""
+    chapters = [make_chapter(0, "第0章", "原來司空學士這個大兒子叫做司空約，即是默愛。")]
+
+    forbidden = forbidden_merges(["司空學士", "司空約"], chapters)
+    evidence = same_reference_merges(["司空學士", "司空約"], chapters, forbidden=forbidden)
+
+    assert forbidden, "应识别为父子"
+    assert frozenset({"司空學士", "司空約"}) not in evidence
+
+
+def test_format_same_reference_evidence_block() -> None:
+    """函数会把名字对**排序后**输出（`A = B` 的左右顺序按 Unicode 码点）。"""
+    block = format_same_reference_evidence({frozenset({"甲", "乙"}): "甲即是乙"})
+
+    assert "乙 = 甲" in block
+    assert "甲即是乙" in block
+    assert format_same_reference_evidence({}) == "（无）"
+
+
+def test_alias_prompt_includes_same_reference_block() -> None:
+    prompt = build_alias_prompt("- 甲：①句子", same_reference="- 甲 = 乙    原文依据：甲即是乙")
+
+    assert "【同指强证据】" in prompt
+    assert "甲 = 乙" in prompt
+    assert "不要用\"出现次数多少\"作为判据" in prompt
+
+
+def test_alias_prompt_defaults_same_reference_to_none() -> None:
+    assert "（无）" in build_alias_prompt("- 甲：①句子")
+
+
+def test_apply_same_reference_creates_group_when_none_exists() -> None:
+    groups, notes = apply_same_reference_merges([], {frozenset({"趙如子", "趙白"}): "证据"})
+
+    assert len(groups) == 1
+    assert set(groups[0].all_names()) == {"趙如子", "趙白"}
+    assert notes
+
+
+def test_apply_same_reference_merges_two_groups() -> None:
+    """LLM 把同一人判成两组 → 同指证据把两组并起来。"""
+    groups = [
+        CharacterGroup(main="趙如子", aliases=["如子"]),
+        CharacterGroup(main="趙白", aliases=["趙非玉"]),
+    ]
+
+    merged, notes = apply_same_reference_merges(groups, {frozenset({"趙如子", "趙白"}): "证据"})
+
+    assert len(merged) == 1
+    assert merged[0].main in {"趙如子", "趙白"}
+    assert set(merged[0].all_names()) == {"趙如子", "趙白", "如子", "趙非玉"}
+    assert notes
+
+
+def test_apply_same_reference_absorbs_short_forms() -> None:
+    """"如子" ⊂ "趙如子" → 主名确定后把短写法一并收为别名。"""
+    groups, _ = apply_same_reference_merges(
+        [CharacterGroup(main="如子", aliases=[])],
+        {frozenset({"趙如子", "趙白"}): "证据"},
+    )
+
+    names = set(groups[0].all_names())
+    assert "如子" in names, "短写法要跟着并进来"
+    assert {"趙如子", "趙白"} <= names
+
+
+def test_apply_same_reference_keeps_existing_alias() -> None:
+    groups = [CharacterGroup(main="趙如子", aliases=["晚生"], reason="原有")]
+    groups, _ = apply_same_reference_merges(groups, {frozenset({"趙如子", "趙白"}): "证据"})
+
+    assert groups[0].main == "趙如子"
+    assert set(groups[0].aliases) == {"晚生", "趙白"}
+
+
+def test_apply_same_reference_no_evidence_is_noop() -> None:
+    groups = [CharacterGroup(main="甲", aliases=["乙"])]
+
+    assert apply_same_reference_merges(groups, {}) == (groups, [])
+
+
+def test_merge_aliases_forces_merge_from_evidence() -> None:
+    """端到端：即使 LLM 什么都没合并，同指证据也要把该合的人合上。"""
+    client = make_client([fake_response('{"groups": []}')])
+    chapters = [make_chapter(0, "第0章", SAME_PERSON_SENTENCE)]
+    evidence = same_reference_merges(["趙如子", "趙白"], chapters)
+
+    groups, notes = merge_aliases(
+        client,
+        {"趙如子": ["趙如子道：「晚生趙白。」"], "趙白": ["趙白少年儒雅。"]},
+        same_reference=evidence,
+    )
+
+    assert len(groups) == 1
+    assert {"趙如子", "趙白"} <= set(groups[0].all_names())
+    assert any("同指证据" in note for note in notes)
+
+
+def test_merge_aliases_keeps_forbidden_priority_over_same_reference() -> None:
+    """父子既被判异指，又有别处的"就是"句式 → 不能合并。"""
+    client = make_client([fake_response('{"groups": []}')])
+    chapters = [make_chapter(0, "第0章", "原來司空學士這個大兒子叫做司空約，即是默愛。")]
+    forbidden = forbidden_merges(["司空學士", "司空約"], chapters)
+    evidence = same_reference_merges(["司空學士", "司空約"], chapters, forbidden=forbidden)
+
+    groups, _ = merge_aliases(
+        client,
+        {"司空學士": ["司空學士的花園。"], "司空約": ["司空約道：「孩兒要說。」"]},
+        forbidden=forbidden,
+        same_reference=evidence,
+    )
+
+    assert groups == [], "父子不得被合并"
+
+
+def test_occurrence_count_is_not_a_merge_judgement() -> None:
+    """确保"出现次数"没有掺进归并判据（真踩过：趙白 79 次 > 趙如子 34 次被当成反证）。
+
+    这里构造两个次数悬殊但**有同指证据**的名字，必须合并。
+    """
+    client = make_client([fake_response('{"groups": []}')])
+    chapters = [make_chapter(0, "第0章", SAME_PERSON_SENTENCE)]
+    evidence = same_reference_merges(["趙如子", "趙白"], chapters)
+
+    groups, _ = merge_aliases(
+        client,
+        {"趙白": ["趙白出現很多次。"], "趙如子": ["趙如子出現較少。"]},
+        same_reference=evidence,
+    )
+
+    assert len(groups) == 1
+
+
+def test_same_reference_marker_table_covers_design_examples() -> None:
+    """标记词要覆盖"化名/本名/小名/表字/即是/自称"这几类。"""
+    from booksoul.extract import SAME_REFERENCE_MARKERS
+
+    for marker in ("即是", "就是", "自稱", "化名", "本名", "小名", "表字", "賤字"):
+        assert marker in SAME_REFERENCE_MARKERS
 
 
 # ────────────────────────── 缓存指纹 ──────────────────────────

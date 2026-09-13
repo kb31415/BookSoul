@@ -96,9 +96,17 @@ def build_name_prompt(chapter_title: str, chapter_text: str) -> str:
     )
 
 
-def build_alias_prompt(name_contexts: str) -> str:
-    """Prompt 2 的 user 部分：候选名称及其上下文（§4）。"""
-    return render_prompt("merge_aliases", name_contexts=name_contexts)
+def build_alias_prompt(name_contexts: str, same_reference: str = "（无）") -> str:
+    """Prompt 2 的完整文本：候选名称及上下文（§4）。
+
+    `same_reference` 是**同指强证据**（原文明说"X 就是 Y"）—— 单独一段写进去，
+    让模型不必靠猜。模板里对应 `{same_reference}` 占位符。
+    """
+    return render_prompt(
+        "merge_aliases",
+        name_contexts=name_contexts,
+        same_reference=same_reference,
+    )
 
 
 # ══════════════════════════ 输出解析 ══════════════════════════
@@ -628,7 +636,7 @@ def forbidden_merges(
     *,
     max_pairs: int = 200,
 ) -> dict[frozenset[str], str]:
-    """算出**禁止合并**的名字对（P0-3）。
+    """算出**禁止合并**的名字对（P0-3，异指证据）。
 
     判据：原文里存在一句话，把一个名字与另一个名字用**亲属词 + 系词**连起来。
     返回 `{frozenset({A, B}): 证据}`。
@@ -655,6 +663,223 @@ def forbidden_merges(
                     return forbidden
                 forbidden[frozenset({name_a, name_b})] = f"{left}…{kinship}…{right}"
     return forbidden
+
+
+# ── 同指证据（正向）：原文明说"这两个名字是同一个人" ──
+#
+# 为什么需要：P0-3 只做"异指"（禁止合并）。缺了正向证据，模型只能凭上下文猜，
+# 于是把「趙如子（本名）/ 如子（小名）/ 趙白（女扮男装的化名）/ 趙非玉（表字）」
+# 这组同一人判成了不同人 —— **这四个合并是对的**，原文有四处直接点破：
+#
+#   1. 「趙如子因打一恭道：『晚生趙白，賤字非玉』」——自我介绍用化名
+#   2. 「和詩之趙如子即是趙白」——原文直接点破同指
+#   3. 「這趙如子不是男人，就是老身嫡…」——赵妈妈揭穿性别
+#   4. 「列眉村晚學趙白非玉氏題」／「列眉村趙如子奉和」——同一人两种落款
+#
+# ⚠️ 明确**不把"出现次数"当判据**：趙白 79 次 > 趙如子 34 次 不是反证 ——
+#    女扮男装的故事里她大部分时间以男装身份活动，这是全书主线。按次数判会正好判反。
+
+#: 同指标记词（连接"同一个人的两个名字"）。
+SAME_REFERENCE_MARKERS: tuple[str, ...] = (
+    "即是", "就是", "便是", "乃是", "原來是", "原来是", "本是", "本是同一人",
+    "自稱", "自称", "化名", "本名", "原名", "本姓", "小名", "乳名", "表字", "賤字",
+    "贱字", "字", "名喚", "名唤", "叫做", "叫作", "名叫", "即是同一人",
+)
+#: 同指句里两个名字的分隔与断句符。
+_NAME_TOKEN = r"[^\s。！？；：，、“”‘’（）《》「」『』]{2,8}"
+_SAME_REFERENCE_PATTERN = re.compile(
+    rf"(?P<a>{_NAME_TOKEN})"
+    rf"(?:[^\n。！？；]{{0,4}}?)(?P<marker>{'|'.join(SAME_REFERENCE_MARKERS)})"
+    rf"(?:[^\n。！？；]{{0,4}}?)(?P<b>{_NAME_TOKEN})"
+)
+
+
+def find_same_reference_sentences(source_text: str) -> list[tuple[str, str, str]]:
+    """在原文里找"同指句"，返回 `[(A, 依据词, B)]`。
+
+    只认**一句话里同时出现两个名字与同指标记词**的形态，例如：
+
+    - `和詩之趙如子即是趙白` → `(趙如子, 即是, 趙白)`
+    - `晚生趙白，賤字非玉` → `(趙白, 賤字, 非玉)`
+    """
+    found: list[tuple[str, str, str]] = []
+    for match in _SAME_REFERENCE_PATTERN.finditer(source_text):
+        left, marker, right = match.group("a"), match.group("marker"), match.group("b")
+        if left == right:
+            continue
+        found.append((left, marker, right))
+    return found
+
+
+def _pick_most_specific(hits: list[str]) -> list[str]:
+    """同一侧命中的名字里，去掉"是别人子串"的短写法。
+
+    "和詩之趙如子" 会同时命中 `趙如子` 和 `如子`（后者是前者的子串）——
+    它们是**同一个名字的两种写法**，不是两个名字，只该留最长的那个。
+    """
+    return [name for name in hits if not any(name != other and name in other for other in hits)]
+
+
+def same_reference_merges(
+    names: Iterable[str],
+    chapters: list[Chapter],
+    *,
+    forbidden: dict[frozenset[str], str] | None = None,
+    max_pairs: int = 200,
+) -> dict[frozenset[str], str]:
+    """算出**应当合并**的名字对（同指证据），返回 `{frozenset({A, B}): 证据}`。
+
+    与 `forbidden_merges` 相反：这里是**正向强证据**。命中即可强制合并，
+    不必再问 LLM（`HANDOFF.md` 纪律：确定性的事别交给 LLM 反复烧钱试）。
+
+    两个名字都必须是**候选名**（`names`）—— 正则会在句子层面切出很多非人名的
+    片段，用候选名集合过滤掉它们。
+
+    `forbidden` 里的对**优先级更高**：若同一对既像同指又被判异指（例如"A 的父亲
+    叫 B"里恰好出现过"就是"），以异指为准，不合并。
+    """
+    candidate_names = [name for name in names if name]
+    if len(candidate_names) < 2 or max_pairs <= 0:
+        return {}
+
+    full_text = "\n".join(chapter.content for chapter in chapters)
+    forbidden = forbidden or {}
+    evidence: dict[frozenset[str], str] = {}
+    checked = 0
+
+    for left, marker, right in find_same_reference_sentences(full_text):
+        hits_left = _pick_most_specific([name for name in candidate_names if name in left])
+        hits_right = _pick_most_specific([name for name in candidate_names if name in right])
+        for name_a in hits_left:
+            for name_b in hits_right:
+                if name_a == name_b:
+                    continue
+                pair = frozenset({name_a, name_b})
+                if pair in forbidden:
+                    continue  # 异指优先
+                checked += 1
+                if checked > max_pairs:
+                    return evidence
+                evidence.setdefault(pair, f"{left}…{marker}…{right}")
+    return evidence
+
+
+def _absorb_short_forms(groups: list[CharacterGroup], alias_pool: list[str]) -> None:
+    """把**属于某组主名子串**的候选收进该组别名（"如子" ⊂ "趙如子"）。
+
+    短写法本身不构成独立的同指证据（见 `same_reference_merges` 的包含过滤），
+    但它确实是同一个人的称呼 —— 所以主名定了之后要收进来。
+    """
+    mains = [group.main for group in groups]
+    for group in groups:
+        for name in alias_pool:
+            if not name or name == group.main or name in group.aliases:
+                continue
+            # 只收"比主名短、且是主名子串"的写法；不要反向吞掉更长的名字
+            if name in group.main and not any(name == other for other in mains):
+                group.aliases = list(dict.fromkeys([*group.aliases, name]))
+
+
+def _merge_groups_by_containment(groups: list[CharacterGroup]) -> list[CharacterGroup]:
+    """主名之间有包含关系的组要并起来（"如子" 与 "趙如子" 本就是同一人）。"""
+    merged = [group.model_copy(deep=True) for group in groups]
+    changed = True
+    while changed:
+        changed = False
+        for index, group in enumerate(merged):
+            for other_index in range(index + 1, len(merged)):
+                other = merged[other_index]
+                a, b = group.main, other.main
+                if not (a in b or b in a):
+                    continue
+                primary, secondary = (group, other) if display_width(a) >= display_width(b) else (other, group)
+                primary.aliases = list(
+                    dict.fromkeys(
+                        [
+                            *primary.aliases,
+                            secondary.main,
+                            *[name for name in secondary.aliases if name != primary.main],
+                        ]
+                    )
+                )
+                merged.remove(secondary)
+                changed = True
+                break
+            if changed:
+                break
+    return merged
+
+
+def apply_same_reference_merges(
+    groups: list[CharacterGroup],
+    evidence: dict[frozenset[str], str],
+    *,
+    alias_pool: Iterable[str] | None = None,
+) -> tuple[list[CharacterGroup], list[str]]:
+    """把同指证据**合并进** LLM 给的人物组（正向）。
+
+    步骤：
+
+    1. 按证据把名字对并组（已在同组不动、跨组则并、都不在任何组则新建）
+    2. **主名之间有包含关系的组再并一次**（"如子" / "趙如子"）
+    3. 把 `alias_pool` 里属于某组主名子串的短写法收为该组别名
+
+    返回 `(新组列表, 说明)`。
+    """
+    if not evidence and not groups:
+        return groups, []
+
+    working = [group.model_copy(deep=True) for group in groups]
+    notes: list[str] = []
+
+    for pair, proof in evidence.items():
+        name_a, name_b = sorted(pair)
+        group_a = next((g for g in working if name_a in g.all_names()), None)
+        group_b = next((g for g in working if name_b in g.all_names()), None)
+
+        if group_a is not None and group_a is group_b:
+            continue
+
+        if group_a is None and group_b is None:
+            working.append(CharacterGroup(main=name_a, aliases=[name_b], reason=f"同指证据：{proof}"))
+            notes.append(f"按同指证据新建：{name_a} ← {name_b}（{proof}）")
+            continue
+
+        if group_a is not None and group_b is not None:
+            # 两组并一组：主名取"名字更长"的那个（全名比小名/化名完整）
+            primary, secondary = (
+                (group_a, group_b)
+                if display_width(group_a.main) >= display_width(group_b.main)
+                else (group_b, group_a)
+            )
+            merged_aliases = [
+                name
+                for name in [*primary.aliases, secondary.main, *secondary.aliases]
+                if name != primary.main
+            ]
+            primary.aliases = list(dict.fromkeys(merged_aliases))
+            working.remove(secondary)
+            notes.append(
+                f"按同指证据合并两组：{primary.main} ← {'、'.join(primary.aliases)}（{proof}）"
+            )
+            continue
+
+        # 一个在组里、一个不在 → 把在外的收进组
+        group = group_a or group_b
+        outsider = name_b if group is group_a else name_a
+        assert group is not None
+        group.aliases = list(dict.fromkeys([*group.aliases, outsider]))
+        notes.append(f"按同指证据并入：{group.main} ← {outsider}（{proof}）")
+
+    before = len(working)
+    working = _merge_groups_by_containment(working)
+    if len(working) < before:
+        notes.append("按主名包含关系合并了短写法所在的组")
+
+    if alias_pool:
+        _absorb_short_forms(working, list(alias_pool))
+
+    return working, notes
 
 
 def filter_merge_input(
@@ -704,21 +929,35 @@ def apply_forbidden_merges(
     return filtered, notes
 
 
+def format_same_reference_evidence(evidence: dict[frozenset[str], str]) -> str:
+    """把同指证据整理成给 Prompt 2 的**强正向证据**块。"""
+    if not evidence:
+        return "（无）"
+    lines: list[str] = []
+    for pair, proof in evidence.items():
+        name_a, name_b = sorted(pair)
+        lines.append(f"- {name_a} = {name_b}    原文依据：{proof}")
+    return "\n".join(lines)
+
+
 def merge_aliases(
     client: LLMClient,
     name_contexts: dict[str, list[str]],
     *,
     guard_contexts: bool = True,
     forbidden: dict[frozenset[str], str] | None = None,
+    same_reference: dict[frozenset[str], str] | None = None,
 ) -> tuple[list[CharacterGroup], list[str]]:
     """用 Prompt 2 判断哪些名字指同一个人物（§4）。
 
     `name_contexts` 的格式：`{名字: [含该名字的原文句子, ...]}`。
 
-    返回 `(人物组, 守卫说明)`。默认开启两道守卫：
+    返回 `(人物组, 守卫说明)`。四道机制（都是确定性的，不依赖模型自觉）：
 
-    - `guard_contexts=True`：`contexts` 为空的候选不参与归并（P0-2）
-    - `forbidden`：关系句算出的禁合并对（P0-3）
+    1. `guard_contexts=True`：`contexts` 为空的候选不参与归并（P0-2）
+    2. `same_reference`：原文明说"X 就是 Y" → 作为**强正向证据**写进 prompt（新增）
+    3. `forbidden`：亲属关系句 → 合并结果里把违规别名摘掉（P0-3）
+    4. `same_reference` 里**尚未被 LLM 合并**的 → 直接强制合并（同指是硬事实）
     """
     notes: list[str] = []
     if not name_contexts:
@@ -736,11 +975,17 @@ def merge_aliases(
         marks = "".join(f"{chr(0x2460 + index)}{quote}" for index, quote in enumerate(contexts[:3]))
         lines.append(f"- {name}：{marks or '（无上下文）'}")
 
-    response = client.complete("", build_alias_prompt("\n".join(lines)), json_mode=True)
+    evidence = same_reference or {}
+    evidence_block = format_same_reference_evidence(evidence)
+    response = client.complete(
+        "",
+        build_alias_prompt("\n".join(lines), same_reference=evidence_block),
+        json_mode=True,
+    )
     try:
         groups = parse_alias_groups(response.json())
     except (ValueError, TypeError):
-        return [], notes
+        groups = []
 
     # 只保留真正发生了合并的组（单名成组对下游没意义）
     merged = [
@@ -748,6 +993,13 @@ def merge_aliases(
         for group in groups
         if group.aliases
     ]
+
+    # 同指证据是硬事实：LLM 没合并的直接补上
+    if evidence:
+        merged, applied = apply_same_reference_merges(
+            merged, evidence, alias_pool=list(name_contexts)
+        )
+        notes.extend(applied)
 
     if forbidden:
         merged, rejected = apply_forbidden_merges(merged, forbidden)
