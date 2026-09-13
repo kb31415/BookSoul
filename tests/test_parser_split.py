@@ -268,6 +268,113 @@ def test_blank_input_yields_no_chapters() -> None:
     assert parse_text("\n\n\n", book_id="x").chapters == []
 
 
+# ────────────────── 分隔线分章（第二套判据）──────────────────
+#
+# 实测锚点：《咎由自取》（31 万字）没有「第X章」，只有 `----` 分隔线，
+# 章节标题是分隔线**上一行的短句**。没有这套判据时，兜底会把 24.8 万字主文
+# 当成一块"卷首"再按字数硬切 42 段（切点与真实章节边界无关）。
+
+SEPARATOR = "-" * 50
+
+
+def test_separator_splitting_uses_preceding_short_line_as_title() -> None:
+    text = (
+        f"有病\n{SEPARATOR}\n第一章的正文甲。\n"
+        f"不小心\n{SEPARATOR}\n第一章的正文乙。\n"
+        f"破碎的\n{SEPARATOR}\n第一章的正文丙。\n"
+    )
+
+    novel = parse_text(text, book_id="x")
+
+    assert [c.title for c in novel.chapters] == ["有病", "不小心", "破碎的"]
+    assert novel.chapters[0].content == "第一章的正文甲。"
+
+
+def test_separator_title_must_be_short() -> None:
+    """分隔线上一行是长句子时，不当标题（那是正文）。"""
+    long_line = "他一直觉得不对劲但是从来说不上哪里不对劲这句话很长" * 2
+    text = f"有病\n{SEPARATOR}\n正文甲。\n{long_line}\n{SEPARATOR}\n正文乙。\n"
+
+    novel = parse_text(text, book_id="x")
+
+    assert novel.chapters[0].title == "有病"
+    assert long_line in novel.chapters[0].content
+
+
+def test_separator_drops_short_front_matter() -> None:
+    """首个分隔线之前是书名/简介 —— 太短就当噪声丢掉。"""
+    text = f"《某书》作者：某某\n简介：一句话。\n{SEPARATOR}\n正文甲。\n"
+
+    novel = parse_text(text, book_id="x")
+
+    assert len(novel.chapters) == 1
+    assert "作者" not in novel.chapters[0].content
+
+
+def test_separator_keeps_long_front_matter() -> None:
+    text = "很长的卷首内容。" * 40 + f"\n{SEPARATOR}\n正文甲。\n"
+
+    novel = parse_text(text, book_id="x")
+
+    assert len(novel.chapters) == 2
+    assert "很长的卷首内容" in novel.chapters[0].content
+
+
+def test_separator_wins_when_it_has_much_higher_resolution() -> None:
+    """两套判据都命中时取**分辨率更高**的那套。
+
+    锚点：番外 15 篇有「番外N」标题（标题判据 15 章），而分隔线有 85 条
+    （分隔线判据 85 章）→ 必须用分隔线，否则 24.8 万字主文会被当成一块卷首。
+    """
+    blocks = [f"标题{i}\n{SEPARATOR}\n正文第{i}节。" for i in range(40)]
+    text = "\n".join(blocks) + "\n番外1 后记\n番外正文。\n"
+
+    novel = parse_text(text, book_id="x")
+
+    assert len(novel.chapters) >= 40, "应该按分隔线切，而不是只认「番外1」"
+    assert novel.chapters[0].title == "标题0"
+
+
+def test_title_splitting_wins_when_comparable() -> None:
+    """真有「第X章」的书里偶尔也有分隔线 —— 此时标题判据才是权威。"""
+    text = "第一章 雨夜\n正文甲。\n" f"{SEPARATOR}\n" "第二章 剑冢\n正文乙。\n"
+
+    novel = parse_text(text, book_id="x")
+
+    assert [c.title for c in novel.chapters] == ["第一章 雨夜", "第二章 剑冢"]
+
+
+def test_separator_variants_are_recognised() -> None:
+    for separator in ("----", "————————", "====", "____"):
+        text = f"标题\n{separator}\n正文。\n"
+        novel = parse_text(text, book_id="x")
+        assert novel.chapters, separator
+        assert novel.chapters[0].content == "正文。", separator
+
+
+def test_three_hyphens_is_not_a_separator() -> None:
+    """少于 4 个连字符不算分隔线（正文里的短破折号别当边界）。"""
+    text = "标题\n---\n正文。\n"
+
+    novel = parse_text(text, book_id="x")
+
+    assert "---" in novel.chapters[0].content
+
+
+def test_real_book_shape_with_separators() -> None:
+    """贴近《咎由自取》的真实形态：85 段、无「第X章」。"""
+    blocks = []
+    for index in range(85):
+        body = f"第{index}节的正文内容。" * 150
+        blocks.append(f"小标题{index}\n{SEPARATOR}\n{body}")
+    text = "\n".join(blocks) + "\n"
+
+    novel = parse_text(text, book_id="x")
+
+    assert len(novel.chapters) == 85
+    assert all(chapter.title.startswith("小标题") for chapter in novel.chapters[:-1])
+
+
 def test_chapters_are_chapter_models(sample_novel_text: str) -> None:
     novel = parse_text(sample_novel_text, book_id="sample")
 

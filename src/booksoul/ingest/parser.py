@@ -100,6 +100,22 @@ _CJK = re.compile(r"[\u4e00-\u9fff]")
 #: 标题分隔符（"第一章.雨夜" 要认）。
 _TITLE_FORBIDDEN_PUNCT = re.compile(r"[。！？；!?;]")
 
+# ── 章节分隔线（第二套分章判据）──
+#
+# 实测：《咎由自取》（31 万字，616KB）**没有「第X章」**，只有 `----` 分隔线；
+# 章节标题是**分隔线上一行那个短句**（"下水道的老鼠" / "有病" / "不小心" …）。
+# 这类 txt 在中文网文里很常见（作者用分隔线替代章节标题）。
+#
+# 没有这套判据时，兜底逻辑会把整本主文当成一块"卷首"再按字数硬切，
+# 切点与真实章节边界完全无关 —— 比崩溃更隐蔽（章节内容会被劈开又混在一起）。
+_SEPARATOR_RE = re.compile(r"^[\-\u2014\u2013_=]{4,}$")
+
+#: 分隔线上一行当标题时的最大长度 —— 超过就是正文句子，不是标题。
+SEPARATOR_TITLE_MAX_LENGTH: int = 24
+
+#: 首个分隔线之前的"卷首"（书名 / 简介 / 文案）短于这个值就丢弃。
+_SEPARATOR_HEAD_MIN: int = 120
+
 # ── 清洗：盗版站广告行 ──
 # 原则：**只做确定性清洗，不猜语义**。误删正文比留噪声严重得多，所以
 # ① 明确的书站黑话用 `search`（这些词在正常叙事里几乎不出现）；
@@ -397,9 +413,117 @@ def split_text(
     ]
 
 
+def _split_by_separators(text: str) -> list[Chapter]:
+    """第二套分章判据：用 `----` 分隔线切。
+
+    实测用例《咎由自取》：全篇没有「第X章」，作者用 `----` 分隔章节，
+    **章节标题是分隔线上一行的短句**：
+
+    ```
+    下水道的老鼠
+    --------------------------------------------------
+    「哥哥，你不先给我看看？」
+    ```
+
+    切法（注意标题在分隔线**之前**、正文在**之后**）：
+
+    ```
+     título_i        ← 第 i 章的标题（分隔线上一行）
+    ----            ← 第 i 个分隔线
+     正文_i          ← 第 i 章的正文
+     título_{i+1}    ← 第 i+1 章的标题
+    ----
+    ```
+
+    所以：第 i 章正文 = `第 i 个分隔线之后` → `第 i+1 个标题行之前`。
+    首个分隔线之前是书名/简介/文案，短于 `_SEPARATOR_HEAD_MIN` 就丢弃。
+
+    没有分隔线时返回 `[]`（由调用方继续退到按长度切）。
+    """
+    lines = text.split("\n")
+    separator_indexes = [
+        index for index, line in enumerate(lines) if _SEPARATOR_RE.match(line.strip())
+    ]
+    if not separator_indexes:
+        return []
+
+    # ① 先把每个分隔线的"标题行下标"定位出来（往上找第一个非空行，且必须够短）
+    def find_title_line(separator: int, lower_bound: int) -> int | None:
+        for probe in range(separator - 1, lower_bound - 1, -1):
+            candidate = lines[probe].strip()
+            if not candidate:
+                continue
+            if len(candidate) <= SEPARATOR_TITLE_MAX_LENGTH:
+                return probe
+            return None
+        return None
+
+    titles: list[int | None] = []
+    lower = 0
+    for separator in separator_indexes:
+        title_line = find_title_line(separator, lower)
+        titles.append(title_line)
+        # 下一个标题不会再跑到这一段里
+        lower = separator + 1
+
+    # ② 逐段取正文：[分隔线+1, 下一个标题行)
+    chapters: list[Chapter] = []
+    index = 0
+    for position, separator in enumerate(separator_indexes):
+        start = separator + 1
+        if position + 1 < len(separator_indexes):
+            next_title = titles[position + 1]
+            end = next_title if next_title is not None else separator_indexes[position + 1]
+        else:
+            end = len(lines)
+
+        content = "\n".join(lines[start:end]).strip()
+        title_line = titles[position]
+        title = lines[title_line].strip() if title_line is not None else ""
+
+        # 第 0 段之前（首个分隔线之前）是书名/简介 —— 短则丢弃
+        if position == 0:
+            head = "\n".join(lines[: title_line if title_line is not None else separator]).strip()
+            if len(head) >= _SEPARATOR_HEAD_MIN:
+                chapters.append(Chapter(index=index, title="（卷首）", content=head))
+                index += 1
+
+        if content:
+            chapters.append(
+                Chapter(index=index, title=title or f"第{index + 1}节", content=content)
+            )
+            index += 1
+
+    # ③ 最后一个分隔线之后可能还有内容（书末）
+    tail_start = separator_indexes[-1] + 1
+    tail = "\n".join(lines[tail_start:]).strip()
+    if tail and (not chapters or tail != chapters[-1].content):
+        first_line = tail.split("\n")[0].strip()
+        label = first_line if len(first_line) <= SEPARATOR_TITLE_MAX_LENGTH else "（书末）"
+        chapters.append(Chapter(index=index, title=label, content=tail))
+
+    return chapters
+
+
 def _split_into_chapters(text: str, fallback_length: int) -> list[Chapter]:
     spans = _scan_titles(text)
+    by_separator = _split_by_separators(text)
+
+    # 两套判据都可能命中，取**分辨率更高**的那套。
+    #
+    # 为什么要比较：《咎由自取》里两套都命中 —— 番外 15 篇有「番外N」标题（标题判据
+    # 抓到 15 章），而 `----` 分隔线有 85 条（分隔线判据抓到 85 章）。若只认标题判据，
+    # 24.8 万字主文会整体落进"第一个标题之前"被当成一块（卷首），再按字数硬切成
+    # 42 段 —— 切点与真实章节边界无关，比崩溃更隐蔽。
+    #
+    # 反向也不能一刀切用分隔线：真有「第X章」的书里，正文偶尔也会有分隔线，
+    # 此时标题判据才是权威（名字比"第N节"有意义）。所以按"谁能切出更多真实边界"选。
+    if by_separator and len(by_separator) > 2 * len(spans):
+        return by_separator
+
     if not spans:
+        if by_separator:
+            return by_separator
         return split_text(text, length=fallback_length)
 
     chapters: list[Chapter] = []
@@ -457,14 +581,27 @@ def split_long_chapters(
 # ────────────────────────── 解析入口 ──────────────────────────
 
 
+#: 文件名里常见的"书名装饰"符号 —— 它们不是书名的一部分，book_id 里要去掉。
+_BOOK_ID_TRIM = "《》〈〉「」『』【】[]()（）\"'“”‘’ 　._-—·"
+
+#: book_id 的最大长度（太长会把文件路径撑爆，也难读）。
+_BOOK_ID_MAX_LENGTH: int = 60
+
+
 def book_id_from_path(path: str | Path, content: str = "") -> str:
     """从文件名派生 `book_id`（阶段 3 起 `data/cards/{book_id}/` 用它）。
 
-    文件名去掉扩展名、清掉文件系统不友好字符后就是 `book_id`；如果文件名
-    没有任何可用字符（比如全是标点），退回用内容哈希，保证唯一。
+    规则：去掉扩展名 → 去掉书名号/引号这类装饰 → 把文件系统不友好字符换成 `_`。
+
+    实测用例：`《咎由自取》.txt` 应该得到 `咎由自取`，
+    而不是 `《咎由自取》`（书名号进目录名既难看又容易出问题）。
+
+    如果清理后什么都不剩（文件名全是标点），退回用内容哈希，保证唯一。
     """
     stem = Path(path).stem
-    slug = re.sub(r'[\\/:*?"<>|\s]+', "_", stem).strip("._")
+    trimmed = stem.strip(_BOOK_ID_TRIM)
+    slug = re.sub(r'[\\/:*?"<>|\s]+', "_", trimmed).strip(_BOOK_ID_TRIM)
+    slug = slug[:_BOOK_ID_MAX_LENGTH]
     if slug:
         return slug
     digest = hashlib.sha1(content.encode("utf-8")).hexdigest()[:12]

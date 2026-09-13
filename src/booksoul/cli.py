@@ -95,10 +95,10 @@ def identify(
 ) -> None:
     """逐章识别人名 → 候选人物列表（阶段 3）。"""
     from booksoul.extract import (
+        collect_same_reference_evidence,
         forbidden_merges,
         identify_candidates,
         merge_aliases,
-        same_reference_merges,
     )
     from booksoul.ingest import from_novel_record
     from booksoul.llm import LLMClient
@@ -145,21 +145,26 @@ def identify(
         contexts = {candidate.name: candidate.contexts for candidate in payload.candidates}
         # 确定性证据（都不问 LLM）：
         #   异指 —— 亲属关系句（"A 的大兒子叫做 B"）→ 禁止合并
-        #   同指 —— 原文点破（"和詩之趙如子即是趙白"）→ 应当合并
+        #   同指 —— 分级：强标记（即是/贱字/小名）强制合并；弱标记（就是）只作提示
         forbidden = forbidden_merges(names, novel.chapters)
-        same_reference = same_reference_merges(names, novel.chapters, forbidden=forbidden)
+        evidence = collect_same_reference_evidence(names, novel.chapters, forbidden=forbidden)
         with console.status("别名归并中（Prompt 2）……"):
             groups, notes = merge_aliases(
                 client,
                 contexts,
                 forbidden=forbidden,
-                same_reference=same_reference,
+                same_reference=evidence,
             )
-        if same_reference:
-            console.print("\n[bold]同指证据[/bold]（原文直接陈述，强制合并）")
-            for pair, proof in same_reference.items():
+        if evidence.forced:
+            console.print("\n[bold]同指强证据[/bold]（几乎不可能误判的句式 → 强制合并）")
+            for pair, proof in evidence.forced.items():
                 left, right = sorted(pair)
                 console.print(f"  {left} = {right}   [dim]{proof}[/dim]")
+        if evidence.hints:
+            console.print("\n[bold]同指弱证据[/bold]（如「就是」→ 交给 LLM 结合上下文裁决）")
+            for pair, proof in evidence.hints.items():
+                left, right = sorted(pair)
+                console.print(f"  {left} ?= {right}   [dim]{proof}[/dim]")
         if groups:
             console.print("\n[bold]别名归并[/bold]")
             for group in groups:

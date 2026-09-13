@@ -41,19 +41,27 @@ __all__ = [
     "DEFAULT_CHAPTER_CHAR_LIMIT",
     "DEFAULT_TOP_N",
     "KINSHIP_TERMS",
+    "SAME_REFERENCE_MARKERS",
+    "STRONG_SAME_MARKERS",
+    "WEAK_SAME_MARKERS",
     "Candidate",
     "CandidateList",
     "ChapterScanResult",
     "CharacterGroup",
     "IdentifyReport",
+    "SameReferenceEvidence",
     "apply_forbidden_merges",
+    "apply_same_reference_merges",
     "build_alias_prompt",
     "build_name_prompt",
     "chapter_cache_fingerprint",
     "collect_contexts",
+    "collect_same_reference_evidence",
     "filter_merge_input",
     "find_family_relations",
+    "find_same_reference_sentences",
     "forbidden_merges",
+    "format_same_reference_evidence",
     "identify_candidates",
     "identify_chapters",
     "merge_aliases",
@@ -62,6 +70,7 @@ __all__ = [
     "parse_names",
     "rank_candidates",
     "resolve_source_form",
+    "same_reference_merges",
     "sample_contexts",
     "scan_chapter",
     "simplify",
@@ -679,45 +688,232 @@ def forbidden_merges(
 # ⚠️ 明确**不把"出现次数"当判据**：趙白 79 次 > 趙如子 34 次 不是反证 ——
 #    女扮男装的故事里她大部分时间以男装身份活动，这是全书主线。按次数判会正好判反。
 
-#: 同指标记词（连接"同一个人的两个名字"）。
-SAME_REFERENCE_MARKERS: tuple[str, ...] = (
-    "即是", "就是", "便是", "乃是", "原來是", "原来是", "本是", "本是同一人",
-    "自稱", "自称", "化名", "本名", "原名", "本姓", "小名", "乳名", "表字", "賤字",
-    "贱字", "字", "名喚", "名唤", "叫做", "叫作", "名叫", "即是同一人",
+# ── 同指证据：分级 + 「紧邻」判据 ──
+#
+# 【血的教训】早期版本把「周燎这辈子最恨的就是秦湛」判成了 `周燎 = 秦湛`，
+# 又把「陈羡说完这两个字就见周燎…」判成 `周燎 = 陈羡`，**把男主、反派、配角
+# 合并成了一个人**，人设直接被毁。两侧都是真实人名，靠"候选名集合"挡不住 ——
+# 只能靠**紧邻性**：同指标记两边必须紧贴着名字，"最多 4 字"是灾难。
+#
+# 两条设计原则（用户明确要求）：
+#
+# ① **紧邻**：标记左边必须是候选名的**结尾**（中间只能有标点），
+#    右边必须以候选名开头。`A 最恨的就是 B` 的"就是"左边是"最恨的"（不是名字
+#    结尾）→ 直接否决。
+# ② **分级处置**：误判代价不对称 —— 异指误判只是"少个别名"（可人工补），
+#    同指误判是"静默毁掉人设"。所以强制合并（跳过 LLM）只留给**几乎不可能误判**的
+#    句式；`就是` 是"是"的重音形式（判断/强调/让步/骂人/比喻都能用）→ 降级为
+#    **提示**，由 Prompt 2 结合上下文裁决。
+
+#: 强同指标记：几乎只用于身份判定 → 命中即**强制合并**。
+STRONG_SAME_MARKERS: tuple[str, ...] = (
+    "不是別人，正是", "不是别人，正是", "不是別人正是", "不是别人正是",
+    "並非別人，而是", "并非别人，而是",
+    "即是", "即為", "即为", "即係", "即系",
+    "賤字", "贱字", "小名", "乳名", "化名", "本名", "原名", "本姓",
 )
-#: 同指句里两个名字的分隔与断句符。
-_NAME_TOKEN = r"[^\s。！？；：，、“”‘’（）《》「」『』]{2,8}"
-_SAME_REFERENCE_PATTERN = re.compile(
-    rf"(?P<a>{_NAME_TOKEN})"
-    rf"(?:[^\n。！？；]{{0,4}}?)(?P<marker>{'|'.join(SAME_REFERENCE_MARKERS)})"
-    rf"(?:[^\n。！？；]{{0,4}}?)(?P<b>{_NAME_TOKEN})"
+#: 弱同指标记：有身份判定用途，但也能当普通动词 → 只作**提示**，不强制合并。
+WEAK_SAME_MARKERS: tuple[str, ...] = (
+    "就是", "便是", "乃是", "原來是", "原来是", "本是", "本是同一人", "即是同一人",
+    "自稱", "自称", "名喚", "名唤", "叫做", "叫作", "名叫", "别名", "筆名", "笔名",
 )
 
+#: 兼容旧名（测试与外部引用可能还在用）。
+SAME_REFERENCE_MARKERS: tuple[str, ...] = STRONG_SAME_MARKERS + WEAK_SAME_MARKERS
 
-def find_same_reference_sentences(source_text: str) -> list[tuple[str, str, str]]:
-    """在原文里找"同指句"，返回 `[(A, 依据词, B)]`。
+#: 名字的字符集：不含空白与各类标点。
+_NAME_CHARS = r"[^\s。！？；：，、,.!?;:“”‘’（）()《》〈〉「」『』【】\[\]]"
+#: 名字长度范围。
+_NAME_MIN, _NAME_MAX = 2, 8
 
-    只认**一句话里同时出现两个名字与同指标记词**的形态，例如：
+#: 弱标记允许标记与名字之间出现的"称呼类"字（不能是实义动词）。
+_WEAK_INTERVENING = r"[其本原這这那也即便正乃為为是\s，,、]*"
+#: 标点与空白（强标记两边只允许这些）。
+_PUNCT = r"[\s，,、。；;：:！!？?…“”‘’（）()《》〈〉「」『』【】\[\]]*"
 
-    - `和詩之趙如子即是趙白` → `(趙如子, 即是, 趙白)`
-    - `晚生趙白，賤字非玉` → `(趙白, 賤字, 非玉)`
-    """
-    found: list[tuple[str, str, str]] = []
-    for match in _SAME_REFERENCE_PATTERN.finditer(source_text):
-        left, marker, right = match.group("a"), match.group("marker"), match.group("b")
-        if left == right:
+#: 右名首字不能是这些（指示代词/量词/动词/连词 —— "这双眼睛""个疯子"都不是名字）。
+_BAD_NAME_HEAD = set("這这那哪个些位双隻只条张张把个件次点儿里中上下后前他她它你我谁什怎是的不和与在有为")
+#: 右名不能整体等于这些（纯代词/泛称）。
+_BAD_NAMES = {
+    "他", "她", "它", "你", "我", "誰", "谁", "別人", "别人", "自己", "大家",
+    "眾人", "众人", "男人", "女人", "那人", "這人", "这人", "個瘋子", "个疯子",
+    "瘋子", "疯子", "這樣", "这样", "那樣", "那样", "什麼", "什么",
+}
+
+#: 「不是别人，正是 X」句里"他/她"这类代词做右侧 → 不是名字对，跳过。
+_PRONOUN_RIGHT = {"他", "她", "它", "祂"}
+
+
+def _longest_name_ending_at(text: str, end: int, candidates: list[str]) -> str | None:
+    """找出**恰好以 `end` 为结尾**的最长候选名（紧邻性判据 ① 的左侧实现）。"""
+    best: str | None = None
+    for name in candidates:
+        if not name or len(name) > end:
             continue
-        found.append((left, marker, right))
+        if text[end - len(name) : end] != name:
+            continue
+        if best is None or len(name) > len(best):
+            best = name
+    return best
+
+
+def _longest_name_starting_at(text: str, start: int, candidates: list[str]) -> str | None:
+    """找出**恰好从 `start` 开始**的最长候选名（紧邻性判据 ① 的右侧实现）。"""
+    best: str | None = None
+    for name in candidates:
+        if not name:
+            continue
+        if text[start : start + len(name)] != name:
+            continue
+        if best is None or len(name) > len(best):
+            best = name
+    return best
+
+
+def _accept_right_name(text: str, start: int, name: str) -> bool:
+    """右名形态校验：不是代词/泛称，且后面不紧跟指示代词或量词。
+
+    `秦湛这双眼睛` 里 "秦湛" 后面紧跟 "这" —— 那是名词短语，不是同指陈述。
+    """
+    if name in _BAD_NAMES or name in _PRONOUN_RIGHT:
+        return False
+    if name[0] in _BAD_NAME_HEAD:
+        return False
+    following = text[start + len(name) : start + len(name) + 1]
+    if following in {"這", "这", "那", "雙", "双", "個", "个", "些"}:
+        return False
+    return True
+
+
+def _scan_marker(
+    text: str,
+    markers: tuple[str, ...],
+    candidates: list[str],
+    *,
+    strict_adjacency: bool,
+) -> list[tuple[str, str, str, str, int]]:
+    """按一组标记扫全文，返回 `[(左名, 右名, 标记, 上下文, 位置)]`。
+
+    `strict_adjacency=True`（强标记）：标记两侧**只允许标点**（紧邻性）；
+    `False`（弱标记）：左侧仍须紧邻，右侧允许少量称呼类字（"趙白，賤字非玉"）。
+    """
+    if not markers:
+        return []
+
+    left_pattern = rf"(?P<left>{_NAME_CHARS}{{{_NAME_MIN},{_NAME_MAX}}}){_PUNCT}"
+    if strict_adjacency:
+        right_pattern = _PUNCT + rf"(?P<right>{_NAME_CHARS}{{{_NAME_MIN},{_NAME_MAX}}})"
+    else:
+        right_pattern = _WEAK_INTERVENING + rf"(?P<right>{_NAME_CHARS}{{{_NAME_MIN},{_NAME_MAX}}})"
+
+    pattern = re.compile(
+        left_pattern + rf"(?P<marker>{'|'.join(re.escape(m) for m in markers)})" + right_pattern
+    )
+
+    found: list[tuple[str, str, str, str, int]] = []
+    for match in pattern.finditer(text):
+        left_end = match.start("left") + len(match.group("left"))
+        # ① 紧邻性：左侧必须**恰好**是某个候选名的结尾
+        left_name = _longest_name_ending_at(text, left_end, candidates)
+        if left_name is None:
+            continue
+        # ① 紧邻性：右侧必须**恰好**是某个候选名的开头
+        right_name = _longest_name_starting_at(text, match.start("right"), candidates)
+        if right_name is None or right_name == left_name:
+            continue
+        if not _accept_right_name(text, match.start("right"), right_name):
+            continue
+        context = text[max(0, match.start() - 12) : match.end() + 12].replace("\n", " ")
+        found.append((left_name, right_name, match.group("marker"), context, match.start()))
     return found
 
 
-def _pick_most_specific(hits: list[str]) -> list[str]:
-    """同一侧命中的名字里，去掉"是别人子串"的短写法。
+@dataclass
+class SameReferenceEvidence:
+    """同指证据，**按置信度分级**。
 
-    "和詩之趙如子" 会同时命中 `趙如子` 和 `如子`（后者是前者的子串）——
-    它们是**同一个名字的两种写法**，不是两个名字，只该留最长的那个。
+    - `forced`：强标记命中 → 可以跳过 LLM 直接合并
+    - `hints`：弱标记命中 → 只作为提示写进 Prompt 2，由 LLM 结合上下文裁决
+
+    为什么必须分级：强制合并的误判会**静默毁掉人设**（周燎/秦湛那次），
+    而漏合并只是少个别名、人工能补。代价不对称，策略就不该一样。
     """
-    return [name for name in hits if not any(name != other and name in other for other in hits)]
+
+    forced: dict[frozenset[str], str] = field(default_factory=dict)
+    hints: dict[frozenset[str], str] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.forced or self.hints)
+
+    def as_dict(self) -> dict[str, dict[str, str]]:
+        return {
+            "forced": {f"{a} = {b}": proof for pair, proof in self.forced.items() for a, b in [sorted(pair)]},
+            "hints": {f"{a} = {b}": proof for pair, proof in self.hints.items() for a, b in [sorted(pair)]},
+        }
+
+
+def find_same_reference_sentences(source_text: str) -> list[tuple[str, str, str]]:
+    """兼容入口：正则粗扫同指句（**不带紧邻性校验**，仅用于调试/展示）。
+
+    真正用于判定的请走 `collect_same_reference_evidence()`。
+    """
+    pattern = re.compile(
+        rf"(?P<a>{_NAME_CHARS}{{{_NAME_MIN},{_NAME_MAX}}}){_PUNCT}"
+        rf"(?P<marker>{'|'.join(re.escape(m) for m in SAME_REFERENCE_MARKERS)})"
+        rf"{_PUNCT}(?P<b>{_NAME_CHARS}{{{_NAME_MIN},{_NAME_MAX}}})"
+    )
+    return [
+        (m.group("a"), m.group("marker"), m.group("b"))
+        for m in pattern.finditer(source_text)
+        if m.group("a") != m.group("b")
+    ]
+
+
+def collect_same_reference_evidence(
+    names: Iterable[str],
+    chapters: list[Chapter],
+    *,
+    forbidden: dict[frozenset[str], str] | None = None,
+    max_pairs: int = 200,
+) -> SameReferenceEvidence:
+    """算出同指证据（分级），返回 `SameReferenceEvidence`。
+
+    `forbidden` 里的对**优先级更高**：既像同指又被判异指时不合并、不提示。
+    """
+    candidate_names = [name for name in names if name]
+    evidence = SameReferenceEvidence()
+    if len(candidate_names) < 2 or max_pairs <= 0:
+        return evidence
+
+    full_text = "\n".join(chapter.content for chapter in chapters)
+    forbidden = forbidden or {}
+    checked = 0
+
+    # 强标记：紧邻 + 强制合并
+    for left, right, marker, context, _ in _scan_marker(
+        full_text, STRONG_SAME_MARKERS, candidate_names, strict_adjacency=True
+    ):
+        pair = frozenset({left, right})
+        if pair in forbidden:
+            continue
+        checked += 1
+        if checked > max_pairs:
+            return evidence
+        evidence.forced.setdefault(pair, f"{context}（标记：{marker}）")
+
+    # 弱标记：只作提示（且已被强证据覆盖的对不再重复）
+    for left, right, marker, context, _ in _scan_marker(
+        full_text, WEAK_SAME_MARKERS, candidate_names, strict_adjacency=False
+    ):
+        pair = frozenset({left, right})
+        if pair in forbidden or pair in evidence.forced:
+            continue
+        checked += 1
+        if checked > max_pairs:
+            return evidence
+        evidence.hints.setdefault(pair, f"{context}（标记：{marker}）")
+
+    return evidence
 
 
 def same_reference_merges(
@@ -727,41 +923,13 @@ def same_reference_merges(
     forbidden: dict[frozenset[str], str] | None = None,
     max_pairs: int = 200,
 ) -> dict[frozenset[str], str]:
-    """算出**应当合并**的名字对（同指证据），返回 `{frozenset({A, B}): 证据}`。
+    """兼容入口：只返回**可强制合并**的高置信对。
 
-    与 `forbidden_merges` 相反：这里是**正向强证据**。命中即可强制合并，
-    不必再问 LLM（`HANDOFF.md` 纪律：确定性的事别交给 LLM 反复烧钱试）。
-
-    两个名字都必须是**候选名**（`names`）—— 正则会在句子层面切出很多非人名的
-    片段，用候选名集合过滤掉它们。
-
-    `forbidden` 里的对**优先级更高**：若同一对既像同指又被判异指（例如"A 的父亲
-    叫 B"里恰好出现过"就是"），以异指为准，不合并。
+    新代码请直接用 `collect_same_reference_evidence()`（分级）。
     """
-    candidate_names = [name for name in names if name]
-    if len(candidate_names) < 2 or max_pairs <= 0:
-        return {}
-
-    full_text = "\n".join(chapter.content for chapter in chapters)
-    forbidden = forbidden or {}
-    evidence: dict[frozenset[str], str] = {}
-    checked = 0
-
-    for left, marker, right in find_same_reference_sentences(full_text):
-        hits_left = _pick_most_specific([name for name in candidate_names if name in left])
-        hits_right = _pick_most_specific([name for name in candidate_names if name in right])
-        for name_a in hits_left:
-            for name_b in hits_right:
-                if name_a == name_b:
-                    continue
-                pair = frozenset({name_a, name_b})
-                if pair in forbidden:
-                    continue  # 异指优先
-                checked += 1
-                if checked > max_pairs:
-                    return evidence
-                evidence.setdefault(pair, f"{left}…{marker}…{right}")
-    return evidence
+    return collect_same_reference_evidence(
+        names, chapters, forbidden=forbidden, max_pairs=max_pairs
+    ).forced
 
 
 def _absorb_short_forms(groups: list[CharacterGroup], alias_pool: list[str]) -> None:
@@ -929,14 +1097,31 @@ def apply_forbidden_merges(
     return filtered, notes
 
 
-def format_same_reference_evidence(evidence: dict[frozenset[str], str]) -> str:
-    """把同指证据整理成给 Prompt 2 的**强正向证据**块。"""
+def format_same_reference_evidence(evidence: SameReferenceEvidence | dict[frozenset[str], str]) -> str:
+    """把同指证据整理成给 Prompt 2 的**强正向证据**块。
+
+    两段分开写清楚：
+
+    - 「强证据」：几乎不可能误判的句式 → 模型照合并
+    - 「待核实」：弱标记（如"就是"）→ 让模型**结合上下文裁决**，不要盲从
+    """
+    if isinstance(evidence, dict):
+        evidence = SameReferenceEvidence(forced=dict(evidence))
+
     if not evidence:
         return "（无）"
+
     lines: list[str] = []
-    for pair, proof in evidence.items():
-        name_a, name_b = sorted(pair)
-        lines.append(f"- {name_a} = {name_b}    原文依据：{proof}")
+    if evidence.forced:
+        lines.append("【强证据】（原文直接陈述身份，必须合并）")
+        for pair, proof in evidence.forced.items():
+            name_a, name_b = sorted(pair)
+            lines.append(f"- {name_a} = {name_b}    原文：{proof}")
+    if evidence.hints:
+        lines.append("【待核实】（弱标记，可能只是修辞，请结合上下文判断）")
+        for pair, proof in evidence.hints.items():
+            name_a, name_b = sorted(pair)
+            lines.append(f"- {name_a} ?= {name_b}    原文：{proof}")
     return "\n".join(lines)
 
 
@@ -946,7 +1131,7 @@ def merge_aliases(
     *,
     guard_contexts: bool = True,
     forbidden: dict[frozenset[str], str] | None = None,
-    same_reference: dict[frozenset[str], str] | None = None,
+    same_reference: SameReferenceEvidence | None = None,
 ) -> tuple[list[CharacterGroup], list[str]]:
     """用 Prompt 2 判断哪些名字指同一个人物（§4）。
 
@@ -955,13 +1140,17 @@ def merge_aliases(
     返回 `(人物组, 守卫说明)`。四道机制（都是确定性的，不依赖模型自觉）：
 
     1. `guard_contexts=True`：`contexts` 为空的候选不参与归并（P0-2）
-    2. `same_reference`：原文明说"X 就是 Y" → 作为**强正向证据**写进 prompt（新增）
-    3. `forbidden`：亲属关系句 → 合并结果里把违规别名摘掉（P0-3）
-    4. `same_reference` 里**尚未被 LLM 合并**的 → 直接强制合并（同指是硬事实）
+    2. `same_reference.forced`：**强**同指证据 → 句子确定，直接强制合并
+    3. `same_reference.hints`：**弱**同指证据（如"就是"）→ 只写进 prompt 让 LLM 裁决
+    4. `forbidden`：亲属关系句 → 合并结果里把违规别名摘掉（P0-3，优先级最高）
+
+    分级的原因：强制合并的误判会静默毁掉人设，漏合并只是少个别名。
     """
     notes: list[str] = []
     if not name_contexts:
         return [], notes
+
+    evidence = same_reference or SameReferenceEvidence()
 
     candidates = name_contexts
     if guard_contexts:
@@ -975,11 +1164,9 @@ def merge_aliases(
         marks = "".join(f"{chr(0x2460 + index)}{quote}" for index, quote in enumerate(contexts[:3]))
         lines.append(f"- {name}：{marks or '（无上下文）'}")
 
-    evidence = same_reference or {}
-    evidence_block = format_same_reference_evidence(evidence)
     response = client.complete(
         "",
-        build_alias_prompt("\n".join(lines), same_reference=evidence_block),
+        build_alias_prompt("\n".join(lines), same_reference=format_same_reference_evidence(evidence)),
         json_mode=True,
     )
     try:
@@ -994,10 +1181,10 @@ def merge_aliases(
         if group.aliases
     ]
 
-    # 同指证据是硬事实：LLM 没合并的直接补上
-    if evidence:
+    # 强证据是硬事实：LLM 没合并的直接补上
+    if evidence.forced:
         merged, applied = apply_same_reference_merges(
-            merged, evidence, alias_pool=list(name_contexts)
+            merged, evidence.forced, alias_pool=list(name_contexts)
         )
         notes.extend(applied)
 
