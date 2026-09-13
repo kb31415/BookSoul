@@ -1,0 +1,49 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ── 虚拟环境 ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── 测试 / 类型检查缓存 ──
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ── 编辑器 / 系统 ──
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── 临时目录（本机沙箱内 pip / venv 使用）──
+.tmp/
+
+# ── 密钥：绝不入库 ──
+.env
+.env.*
+!.env.example
+*.key
+secrets.toml
+
+# ── 数据产物：小说原文、抽取结果、会话、记忆都不进 git ──
+# 目录结构本身已入库（data/**/.gitkeep，它们在 data/ 被忽略前就 add 了），
+# 之后 data/ 下新增的任何文件都自动忽略。
+data/

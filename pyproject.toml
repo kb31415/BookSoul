@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "booksoul"
+version = "0.1.0"
+description = "书魂 BookSoul —— 从小说里抽出立体角色，并和书里的角色对话"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "BookSoul" }]
+keywords = ["llm", "roleplay", "character-card", "novel", "tavern"]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+# MVP 最小依赖集（MVP_PLAN.md §1）。刻意不引入数据库 / 向量库 / LangChain。
+dependencies = [
+    "pydantic>=2.9",
+    "typer>=0.12",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+# 阶段 3 起启用
+llm = ["litellm>=1.55"]
+# 阶段 7 起启用
+memory = ["jieba>=0.42.1"]
+dev = ["pytest>=8.0"]
+all = ["booksoul[llm,memory,dev]"]
+
+[project.scripts]
+booksoul = "booksoul.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/booksoul"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+filterwarnings = ["error::DeprecationWarning:booksoul.*"]
