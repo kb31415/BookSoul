@@ -146,15 +146,26 @@ class ValidationReport:
 
     @classmethod
     def merge(cls, reports: list[ValidationReport]) -> ValidationReport:
-        """把同一章多个批次的报告合并成一个。"""
+        """把同一章多个批次的报告合并成一个（**逐项去重**）。
+
+        为什么去重：同一章的多个批次几乎总会产出**完全一样**的告警
+        （例如五个字段都超长 → 每批都报一遍）。实测 85 章抽完，
+        `field_length_warnings` 累积到 212 条、其中大量是重复文本，
+        把报告刷成噪声，人工根本看不出真正的问题。
+        """
         merged = cls(chapter_index=reports[0].chapter_index if reports else None)
         for report in reports:
-            merged.cleared_fields.extend(report.cleared_fields)
-            merged.dropped_quotes.extend(report.dropped_quotes)
-            merged.ungrounded_fields.extend(report.ungrounded_fields)
-            merged.cliches.extend(report.cliches)
-            merged.field_length_warnings.extend(report.field_length_warnings)
-            merged.retried_chapters.extend(report.retried_chapters)
+            for target, values in (
+                (merged.cleared_fields, report.cleared_fields),
+                (merged.dropped_quotes, report.dropped_quotes),
+                (merged.ungrounded_fields, report.ungrounded_fields),
+                (merged.cliches, report.cliches),
+                (merged.field_length_warnings, report.field_length_warnings),
+            ):
+                target.extend(value for value in values if value not in target)
+            merged.retried_chapters.extend(
+                index for index in report.retried_chapters if index not in merged.retried_chapters
+            )
         return merged
 
     def as_dict(self) -> dict[str, Any]:

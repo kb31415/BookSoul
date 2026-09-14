@@ -48,3 +48,4 @@ secrets.toml
 # 之后 data/ 下新增的任何文件都自动忽略。
 data/
 .msg.txt
+.msg2.txt

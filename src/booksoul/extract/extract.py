@@ -440,6 +440,13 @@ def extract_persona_for_chapter(
 # ══════════════════════════ 逐章抽取主流程 ══════════════════════════
 
 
+def _extend_unique(target: list[Any], values: Iterable[Any]) -> None:
+    """把 `values` 里**还没出现过**的项追加到 `target`（保持顺序）。"""
+    for value in values:
+        if value not in target:
+            target.append(value)
+
+
 @dataclass
 class ExtractionReport:
     """一次角色抽取的汇总（CLI 打印 & 人工检查用）。
@@ -535,12 +542,14 @@ def extract_chapter_increments(
 
         increments.append(outcome.increment)
         report.chapter_hit += 1
-        report.dropped_quotes.extend(outcome.report.dropped_quotes)
-        report.cleared_fields.extend(outcome.report.cleared_fields)
-        report.ungrounded_fields.extend(outcome.report.ungrounded_fields)
-        report.cliches.extend(outcome.report.cliches)
-        report.field_length_warnings.extend(outcome.report.field_length_warnings)
-        report.retried_chapters.extend(outcome.report.retried_chapters or [])
+        # 逐章累积时也去重：同一类告警（如"flaw: 26 字"）会在几十章里重复出现，
+        # 全量堆进报告只会把真正的问题淹掉（实测累积到 212 条、大量是重复文本）。
+        _extend_unique(report.dropped_quotes, outcome.report.dropped_quotes)
+        _extend_unique(report.cleared_fields, outcome.report.cleared_fields)
+        _extend_unique(report.ungrounded_fields, outcome.report.ungrounded_fields)
+        _extend_unique(report.cliches, outcome.report.cliches)
+        _extend_unique(report.field_length_warnings, outcome.report.field_length_warnings)
+        _extend_unique(report.retried_chapters, outcome.report.retried_chapters or [])
 
         accumulated = merge_persona_increments([accumulated, outcome.increment]).persona
 
