@@ -14,6 +14,19 @@
 - `builder.py`（阶段 5）：补默认值、装配 `character_book`、导出 v2 JSON
 """
 
+from booksoul.assemble.builder import (
+    DEFAULT_TAG,
+    EXPECTED_FIELDS,
+    REQUIRED_FIELDS,
+    BuildReport,
+    CardBundle,
+    build_card,
+    build_description,
+    build_relations,
+    build_timeline,
+    card_to_v2_payload,
+    validate_card,
+)
 from booksoul.assemble.merge import (
     MergedPersona,
     PersonaTimeline,
@@ -41,18 +54,30 @@ from booksoul.assemble.validate import (
 __all__ = [
     "CLICHE_BLACKLIST",
     "DEFAULT_FIELD_LENGTHS",
+    "DEFAULT_TAG",
+    "EXPECTED_FIELDS",
     "MergedPersona",
+    "PERSONA_TEXT_FIELDS",
     "PersonaChange",
     "PersonaIncrement",
     "PersonaTimeline",
     "Quote",
+    "REQUIRED_FIELDS",
     "RelationshipChange",
+    "BuildReport",
+    "CardBundle",
     "TimelinePoint",
     "ValidationReport",
+    "build_card",
+    "build_description",
+    "build_relations",
+    "build_timeline",
+    "card_to_v2_payload",
     "clean_for_matching",
     "find_cliches",
     "merge_persona_increments",
     "quote_is_grounded",
     "relationships_by_target",
+    "validate_card",
     "validate_persona_increment",
 ]

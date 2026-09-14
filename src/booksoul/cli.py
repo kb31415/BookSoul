@@ -191,12 +191,23 @@ def extract(
     aliases: str = typer.Option("", "--aliases", "-a", help="别名，逗号分隔（强烈建议给：检索召回靠它）"),
     max_passage_chars: int = typer.Option(5000, "--max-passage-chars", help="单次喂入的相关段落上限"),
     generate: bool = typer.Option(True, "--generate/--no-generate", help="是否跑 Prompt 4 生成 first_mes"),
+    reuse: bool = typer.Option(
+        False,
+        "--reuse",
+        help="复用已落盘的 persona（跳过逐章抽取，只补跑 Prompt 4）—— 不产生逐章调用",
+    ),
 ) -> None:
     """抽取指定角色的立体字段（阶段 4，🔴 风险点）。"""
     from rich.panel import Panel
 
-    from booksoul.assemble import relationships_by_target
-    from booksoul.extract import extract_character, generate_card_fields
+    from booksoul.assemble import (
+        MergedPersona,
+        PersonaIncrement,
+        PersonaTimeline,
+        TimelinePoint,
+        relationships_by_target,
+    )
+    from booksoul.extract import ExtractionReport, extract_character, generate_card_fields
     from booksoul.ingest import from_novel_record
     from booksoul.llm import LLMClient
 
@@ -212,10 +223,30 @@ def extract(
     alias_list = [item.strip() for item in aliases.split(",") if item.strip()]
     client = LLMClient.from_settings(settings)
 
-    with console.status(f"逐章抽取「{character}」的 persona 增量……"):
-        merged, report = extract_character(
-            novel, client, character, alias_list, max_passage_chars=max_passage_chars
+    if reuse:
+        # 复用已落盘的 persona：**跳过**逐章抽取（那部分是花钱大头），
+        # 只补跑 Prompt 4。适用于"persona 已经抽好、只缺 first_mes"的场景。
+        cached = repositories.cards.load_json(book_id, f"{character}.persona")
+        if not isinstance(cached, dict) or "persona" not in cached:
+            console.print(f"[red]没有可复用的 persona[/red]：{character}.persona.json")
+            raise typer.Exit(code=1)
+
+        persona = PersonaIncrement.model_validate(cached["persona"])
+        timeline = PersonaTimeline(
+            points=[TimelinePoint(**point) for point in (cached.get("timeline") or [])]
         )
+        merged = MergedPersona(persona=persona, timeline=timeline)
+        report = ExtractionReport(
+            character_name=character,
+            chapter_total=cached.get("extraction_report", {}).get("chapter_total", 0),
+            chapter_hit=cached.get("extraction_report", {}).get("chapter_hit", 0),
+        )
+        console.print("[dim]已复用落盘 persona（跳过逐章抽取）[/dim]")
+    else:
+        with console.status(f"逐章抽取「{character}」的 persona 增量……"):
+            merged, report = extract_character(
+                novel, client, character, alias_list, max_passage_chars=max_passage_chars
+            )
 
     persona = merged.persona
     table = Table(title=f"{character} —— persona（{report.chapter_hit}/{report.chapter_total} 章命中）")
@@ -301,6 +332,95 @@ def extract(
         "[yellow]人工把关点[/yellow]：阶段 4 是 MVP 第一风险点 —— "
         "请检查上面的字段是否「像书中人」（不是通用套话）。"
     )
+
+
+@app.command("build")
+def build(
+    book_id: str = typer.Argument(..., help="`ingest` 产出的 book_id"),
+    character: str = typer.Argument(..., help="角色主名（同 `extract` 用过的名字）"),
+    tags: str = typer.Option("", "--tags", "-t", help="额外标签，逗号分隔"),
+) -> None:
+    """组装完整角色卡并导出酒馆 v2 JSON（阶段 5，纯本地不调 API）。"""
+    from booksoul.assemble import (
+        MergedPersona,
+        PersonaIncrement,
+        PersonaTimeline,
+        TimelinePoint,
+        build_card,
+        card_to_v2_payload,
+    )
+
+    settings = load_settings()
+    repositories = build_repositories(settings)
+
+    cached = repositories.cards.load_json(book_id, f"{character}.persona")
+    if not isinstance(cached, dict) or "persona" not in cached:
+        console.print(f"[red]没有可用的人设产物[/red]：{book_id}/{character}.persona.json（先跑 `extract`）")
+        raise typer.Exit(code=1)
+
+    merged = MergedPersona(
+        persona=PersonaIncrement.model_validate(cached["persona"]),
+        timeline=PersonaTimeline(
+            points=[TimelinePoint(**point) for point in (cached.get("timeline") or [])]
+        ),
+    )
+    card_fields = cached.get("card_fields") or {}
+
+    card, report = build_card(
+        character,
+        merged,
+        book_id=book_id,
+        source_book=book_id,
+        first_mes=str(card_fields.get("first_mes", "") or ""),
+        mes_example=str(card_fields.get("mes_example", "") or ""),
+        tags=[item.strip() for item in tags.split(",") if item.strip()],
+    )
+
+    # ① 完整卡片（含 timeline / relations / quotes 等全部立体信息）
+    card_path = repositories.cards.save_json(book_id, f"{character}.card", card.model_dump(mode="json"))
+    # ② 酒馆 v2 导出（可直接拖进 SillyTavern）
+    v2_payload = card_to_v2_payload(card)
+    v2_path = repositories.cards.save_json(book_id, f"{character}.v2", v2_payload)
+
+    table = Table(title=f"{character} —— 角色卡（阶段 5）")
+    table.add_column("字段")
+    table.add_column("内容")
+    table.add_column("长度", justify="right")
+    previews = (
+        ("name", card.name),
+        ("description", card.description.splitlines()[0] if card.description else ""),
+        ("personality", card.personality),
+        ("desire", card.desire),
+        ("flaw", card.flaw),
+        ("secret", card.secret),
+        ("speech_style", card.speech_style),
+        ("first_mes", card.first_mes),
+        ("mes_example", card.mes_example.replace("\n", " ⏎ ")),
+    )
+    for label, value in previews:
+        table.add_row(label, value or "[dim]（空）[/dim]", str(len(value)))
+    console.print(table)
+
+    console.print(
+        f"\n[bold]立体信息[/bold]：relations {report.relation_count} 条"
+        f"（演化 {report.relation_evolution_total} 次）｜"
+        f"timeline {report.timeline_count} 个点｜"
+        f"quotes {report.quote_count} 条｜原话素材 {report.speech_sample_count} 条"
+    )
+    console.print(f"tags：{'、'.join(card.tags)}")
+
+    if report.missing_required:
+        console.print(f"[red]必填字段缺失[/red]：{'、'.join(report.missing_required)}")
+    for warning in report.warnings:
+        console.print(f"  [yellow]告警[/yellow] {warning}")
+    if report.ok and not report.warnings:
+        console.print("[green]格式校验通过[/green]")
+    elif report.ok:
+        console.print("[yellow]格式校验通过（有告警）[/yellow]")
+
+    console.print(f"\n[dim]完整卡片：{card_path}[/dim]")
+    console.print(f"[dim]酒馆 v2  ：{v2_path}[/dim]")
+    console.print("[dim]人工检查：把 v2 文件拖进 SillyTavern，或让格式校验器过一遍[/dim]")
 
 
 def main() -> None:  # pragma: no cover - 入口包装

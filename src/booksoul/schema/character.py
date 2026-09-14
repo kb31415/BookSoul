@@ -103,6 +103,10 @@ class CharacterCard(BaseModel):
     desire: str = ""
     flaw: str = ""
     secret: str = ""
+    #: 说话风格。`PROMPT_DESIGN.md` §5 的 Prompt 3 逐章抽它、§6 的 `mes_example`
+    #: 质量依赖它，但 §6.1 的字段表没列 —— 属实现期补的契约，与
+    #: `desire` / `flaw` / `secret` 同层，走 `extensions.booksoul`。
+    speech_style: str = ""
     timeline: list[TimelineEvent] = Field(default_factory=list)
     relations: list[Relation] = Field(default_factory=list)
     plot_nodes: list[PlotNode] = Field(default_factory=list)

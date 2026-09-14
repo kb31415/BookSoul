@@ -51,7 +51,15 @@ _KNOWN_SPECS = {SPEC_V2, SPEC_V3}
 #: 不认识就忽略的元字段（避免污染 CharacterCard）。
 _META_KEYS = frozenset({"spec", "spec_version", "data", "extensions", "avatar", "create_date"})
 
-_STRUCTURED_KEYS = ("desire", "flaw", "secret", "timeline", "relations", "plot_nodes")
+_STRUCTURED_KEYS = (
+    "desire",
+    "flaw",
+    "secret",
+    "speech_style",
+    "timeline",
+    "relations",
+    "plot_nodes",
+)
 
 #: 这些键由 `LoreEntry` 自己承载，导出时总会重写 —— 所以导入时不算"原始信息"，
 #: 否则会把我们刚写出去的字段当成外部信息留底，导致往返回流不收敛。
@@ -87,6 +95,7 @@ def _booksoul_extension(card: CharacterCard) -> dict[str, Any]:
         "desire": card.desire,
         "flaw": card.flaw,
         "secret": card.secret,
+        "speech_style": card.speech_style,
         "timeline": [e.model_dump(mode="json") for e in card.timeline],
         "relations": [r.model_dump(mode="json", by_alias=True) for r in card.relations],
         "plot_nodes": [n.model_dump(mode="json") for n in card.plot_nodes],
@@ -307,6 +316,7 @@ def from_tavern(raw: dict[str, Any]) -> CharacterCard:
         desire=_as_str(structured.get("desire")),
         flaw=_as_str(structured.get("flaw")),
         secret=_as_str(structured.get("secret")),
+        speech_style=_as_str(structured.get("speech_style")),
         timeline=_parse_models(TimelineEvent, structured.get("timeline")),
         relations=_parse_models(Relation, structured.get("relations")),
         plot_nodes=_parse_models(PlotNode, structured.get("plot_nodes")),
