@@ -47,3 +47,4 @@ secrets.toml
 # 目录结构本身已入库（data/**/.gitkeep，它们在 data/ 被忽略前就 add 了），
 # 之后 data/ 下新增的任何文件都自动忽略。
 data/
+.msg.txt

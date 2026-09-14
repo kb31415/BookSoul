@@ -273,6 +273,23 @@ def extract(
             fields = generate_card_fields(client, character, persona)
         console.print(Panel(fields.first_mes or "[dim]（空）[/dim]", title="first_mes（开场白 / 钩子）"))
         console.print(Panel(fields.mes_example or "[dim]（空）[/dim]", title="mes_example（原话 few-shot）"))
+    else:
+        fields = None
+
+    # 中间产物落盘（`PROMPT_DESIGN.md` §11 / `MVP_PLAN.md` §1：产物路径固定，
+    # 便于后续阶段复用与人工检查；也避免"跑完了但东西只在终端里"）。
+    payload = {
+        "character": character,
+        "aliases": alias_list,
+        "book_id": book_id,
+        "model": client.model,
+        "persona": persona.model_dump(mode="json"),
+        "timeline": merged.timeline.as_dicts(),
+        "card_fields": fields.model_dump(mode="json") if fields else None,
+        "extraction_report": report.as_dict(),
+    }
+    target = repositories.cards.save_json(book_id, f"{character}.persona", payload)
+    console.print(f"\n[dim]产物：{target}[/dim]")
 
     usage = client.usage.as_dict()
     console.print(

@@ -295,6 +295,65 @@ def test_format_persona_summary_includes_relationships_and_changes() -> None:
     assert "变化（desire）：X → Y" in summary
 
 
+# ────────────────── `existing_persona` 必须是压缩摘要，不能线性膨胀 ──────────────────
+#
+# 实测事故：《咎由自取》85 章，把累积的 relationships 原文全倒进每次调用，
+# prompt 从第 0 章 3,299 字符涨到第 19 章 19,420 字符，全量 prompt token 233 万
+# （正常值约 20 万），多花约 11 倍的钱。设计本意是"抽取本章新增或改变"，
+# 摘要只该是个提醒。
+
+def test_persona_summary_caps_relationship_count() -> None:
+    from booksoul.assemble import RelationshipChange
+
+    relationships = [
+        RelationshipChange(target=f"角色{i}", change=f"第{i}章的关系变化描述") for i in range(200)
+    ]
+
+    summary = format_persona_summary({}, relationships=relationships, relation_limit=12)
+
+    # 只列最近 12 条 + 一行省略说明
+    listed = [line for line in summary.splitlines() if line.startswith("- 与「")]
+    assert len(listed) == 12
+    assert "另有 188 条较早的关系变化已省略" in summary
+    assert "角色199" in summary, "应保留**最近**的"
+    assert "角色0」" not in summary
+
+
+def test_persona_summary_truncates_long_relationship_text() -> None:
+    from booksoul.assemble import RelationshipChange
+
+    relationships = [RelationshipChange(target="秦湛", change="很长的一段描述" * 30)]
+
+    summary = format_persona_summary({}, relationships=relationships, relation_chars=40)
+
+    line = next(line for line in summary.splitlines() if line.startswith("- 与「"))
+    assert len(line) < 60
+    assert line.endswith("…")
+
+
+def test_persona_summary_size_is_bounded() -> None:
+    """摘要总长度必须有上限 —— 它是被拼进**每一次**调用的东西。"""
+    from booksoul.assemble import PersonaChange, RelationshipChange
+
+    summary = format_persona_summary(
+        {name: "很长的字段内容" * 5 for name in ("personality", "desire", "flaw", "secret", "speech_style")},
+        relationships=[
+            RelationshipChange(target=f"角色{i}", change="很长的关系描述" * 20) for i in range(100)
+        ],
+        changes=[
+            PersonaChange(**{"field": f"f{i}", "from": "A" * 50, "to": "B" * 50}) for i in range(50)
+        ],
+    )
+
+    assert len(summary) < 1500, f"摘要过长（{len(summary)} 字符），会让 prompt 逐章膨胀"
+
+
+def test_persona_summary_without_relationships_still_lists_fields() -> None:
+    summary = format_persona_summary({"personality": "冷峻"})
+
+    assert summary == "- 性格：冷峻"
+
+
 # ────────────────────────── 输出解析 ──────────────────────────
 
 
@@ -634,6 +693,63 @@ def test_extract_on_empty_novel() -> None:
 
     assert increments == []
     assert report.chapter_total == 0
+
+
+# ────────────────── 同章多批次的合并要去重 ──────────────────
+
+
+def test_merge_increments_dedupes_relationships() -> None:
+    """同一条关系变化在多批次里重复出现时只保留一条。
+
+    实测见过同一条重复 14 次（`relationships` 序列被撑爆）。
+    """
+    from booksoul.assemble import RelationshipChange
+    from booksoul.extract.extract import _merge_increments
+
+    same = RelationshipChange(target="秦湛", change="从记恨升级为主动设局羞辱")
+    other = RelationshipChange(target="白苓", change="关系变化")
+
+    merged = _merge_increments(
+        [
+            PersonaIncrement(relationships=[same]),
+            PersonaIncrement(relationships=[same, other]),
+            PersonaIncrement(relationships=[same]),
+        ]
+    )
+
+    assert len(merged.relationships) == 2
+    assert [r.target for r in merged.relationships] == ["秦湛", "白苓"]
+
+
+def test_merge_increments_dedupes_quotes_and_samples() -> None:
+    from booksoul.assemble import Quote
+    from booksoul.extract.extract import _merge_increments
+
+    quote = Quote(field="personality", text="同一句原文")
+
+    merged = _merge_increments(
+        [
+            PersonaIncrement(quotes=[quote], speech_samples=["原话"]),
+            PersonaIncrement(quotes=[quote], speech_samples=["原话"]),
+        ]
+    )
+
+    assert len(merged.quotes) == 1
+    assert merged.speech_samples == ["原话"]
+
+
+def test_merge_increments_text_fields_take_first_non_empty() -> None:
+    from booksoul.extract.extract import _merge_increments
+
+    merged = _merge_increments(
+        [
+            PersonaIncrement(personality="", desire="甲"),
+            PersonaIncrement(personality="乙", desire="丙"),
+        ]
+    )
+
+    assert merged.personality == "乙"
+    assert merged.desire == "甲"
 
 
 def test_increment_is_empty_only_looks_at_text_fields() -> None:

@@ -196,13 +196,37 @@ def batch_passages(
 # ══════════════════════════ Prompt 3 ══════════════════════════
 
 
+#: `{existing_persona}` 里"关系变化"最多列几条（按章节顺序取**最近**的）。
+#:
+#: 为什么要设上限：这一整段会被拼进**每一次**逐章调用。早期实现把累积的全部
+#: relationships 原文倒进去，于是每章 prompt 线性膨胀，总量 O(n²) ——
+#: 实测《咎由自取》85 章：第 0 章 3,299 字符 → 第 19 章 19,420 字符，
+#: 全量 prompt token 冲到 233 万（约 2.4 元/角色），是正常值的 11 倍。
+#:
+#: 设计本意（`PROMPT_DESIGN.md` §5）是"抽取本章**新增或改变**的信息"，
+#: `{existing_persona}` 只该是**压缩摘要**，不是全量倾倒。
+DEFAULT_RELATION_SUMMARY_LIMIT: int = 12
+
+#: 摘要里每条关系变化最多保留多少字（超出截断）。
+DEFAULT_RELATION_SUMMARY_CHARS: int = 40
+
+
 def format_persona_summary(
     fields: dict[str, str],
     *,
     relationships: list[RelationshipChange] | None = None,
     changes: list[PersonaChange] | None = None,
+    relation_limit: int = DEFAULT_RELATION_SUMMARY_LIMIT,
+    relation_chars: int = DEFAULT_RELATION_SUMMARY_CHARS,
 ) -> str:
-    """把已有画像整理成 `{existing_persona}` 的文本（§5 变量表）。"""
+    """把已有画像整理成 `{existing_persona}` 的文本（§5 变量表）。
+
+    **刻意做成压缩摘要**，不是全量倾倒（见 `DEFAULT_RELATION_SUMMARY_LIMIT` 的说明）：
+
+    - 五个文本字段各一行（本身有长度约束，天然很小）
+    - 关系变化**只列最近的 `relation_limit` 条**，每条截断到 `relation_chars`
+    - `changes` 最多列 5 条（只是"提醒模型别重复"）
+    """
     lines: list[str] = []
     labels = {
         "personality": "性格",
@@ -216,13 +240,22 @@ def format_persona_summary(
         if value:
             lines.append(f"- {label}：{value}")
 
-    for relation in relationships or []:
-        if relation.target or relation.change:
-            lines.append(f"- 与「{relation.target}」：{relation.change}")
+    items = [r for r in (relationships or []) if r.target or r.change]
+    if items:
+        # 取**最近的**若干条（后文更能体现最终状态），并压成一行一条
+        recent = items[-relation_limit:] if relation_limit > 0 else []
+        omitted = len(items) - len(recent)
+        for relation in recent:
+            change = relation.change.strip()
+            if len(change) > relation_chars:
+                change = change[:relation_chars] + "…"
+            lines.append(f"- 与「{relation.target}」：{change}")
+        if omitted > 0:
+            lines.append(f"- （另有 {omitted} 条较早的关系变化已省略）")
 
-    for change in changes or []:
+    for change in (changes or [])[:5]:
         if change.field:
-            lines.append(f"- 变化（{change.field}）：{change.from_} → {change.to}（{change.reason}）")
+            lines.append(f"- 变化（{change.field}）：{change.from_} → {change.to}")
 
     return "\n".join(lines) if lines else "（无，这是首次抽取）"
 
@@ -302,10 +335,14 @@ class _ChapterOutcome:
 
 
 def _merge_increments(increments: list[PersonaIncrement]) -> PersonaIncrement:
-    """同一章多批次的合并：文本字段取第一个非空，列表字段拼接。
+    """同一章多批次的合并：文本字段取第一个非空，列表字段**去重**后拼接。
 
     为什么文本取第一个非空而不是覆盖：分批是**按段落位置**切的，同一章内
     人设本身没有先后演进关系，先抽到的批次不代表更早。
+
+    为什么列表要去重：模型在不同批次里会重复输出同一条关系变化 —— 实测出现过
+    同一条重复 14 次（`relationships` 序列被撑爆、CLI 输出刷屏）。
+    与 `assemble.merge` 的跨章去重保持一致的键。
     """
     if not increments:
         return PersonaIncrement()
@@ -322,11 +359,28 @@ def _merge_increments(increments: list[PersonaIncrement]) -> PersonaIncrement:
     samples: list[str] = []
     relationships: list[RelationshipChange] = []
     changes: list[PersonaChange] = []
+
+    seen_quotes: set[tuple[str, str]] = set()
+    seen_relations: set[tuple[str, str]] = set()
+    seen_changes: set[tuple[str, str, str]] = set()
+
     for item in increments:
-        quotes.extend(item.quotes)
+        for quote in item.quotes:
+            key = (quote.field, quote.text)
+            if key not in seen_quotes:
+                seen_quotes.add(key)
+                quotes.append(quote)
         samples.extend(item.speech_samples)
-        relationships.extend(item.relationships)
-        changes.extend(item.changes)
+        for relation in item.relationships:
+            key = (relation.target, relation.change)
+            if key not in seen_relations:
+                seen_relations.add(key)
+                relationships.append(relation)
+        for change in item.changes:
+            key = (change.field, change.from_, change.to)
+            if key not in seen_changes:
+                seen_changes.add(key)
+                changes.append(change)
 
     return PersonaIncrement(
         **merged,
